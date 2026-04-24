@@ -216,12 +216,35 @@ bridge/.venv/bin/pip install 'openai>=1.40.0'
 **Bridge starts then exits immediately**
 Usually means the Hermes repo can't be imported. Set `HERMES_AGENT_ROOT=/abs/path/to/hermes-agent` in `bridge/.env`.
 
-**BT speaker silent**
-`bluealsa` cannot play MP3 directly; the bridge already converts to 44100 Hz stereo WAV via `ffmpeg`. Confirm the device is reachable:
+**BT speaker silent** (check in this order)
 
-```bash
-aplay -D bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp --dump-hw-params /dev/null
-```
+1. **Bridge routing** — the most common cause. Check the bridge log:
+
+   ```bash
+   journalctl -u ttgo-chat-bridge -n 20 | grep "BT speaker"
+   ```
+
+   If it says `BT speaker: default`, the bridge is playing to onboard ALSA — not to the BT sink. Set `TTGO_BT_DEVICE` in `bridge/.env` and restart:
+
+   ```bash
+   echo 'TTGO_BT_DEVICE=bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp' >> bridge/.env
+   sudo systemctl restart ttgo-chat-bridge
+   ```
+
+2. **BT volume** — bluealsa sink volume tracks the remote device and can end up very low (e.g. 6/127). Check and bump:
+
+   ```bash
+   bluealsa-cli volume /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dpsrc/sink       # read
+   bluealsa-cli volume /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dpsrc/sink 90    # set
+   ```
+
+   Note: volume alone is never the fix if routing is wrong — the PCM never opens, so the change is inaudible regardless.
+
+3. **Device reachable** — `bluealsa` cannot play MP3 directly; the bridge already converts to 44100 Hz stereo WAV via `ffmpeg`. Verify the sink:
+
+   ```bash
+   aplay -D bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp --dump-hw-params /dev/null
+   ```
 
 **RIGHT button feels flaky / PTT starts on reset**
 GPIO 0 is a boot-strap pin. Power-cycle the device without the button held. If the issue persists, swap LEFT/RIGHT roles in firmware (PTT on GPIO 35, new-chat on GPIO 0).
