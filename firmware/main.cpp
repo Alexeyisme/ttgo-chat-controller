@@ -137,6 +137,8 @@ void drawConnDot(bool connected) {
 
 // ── Screen renderers ──────────────────────────────────────────────────────────
 void renderIdle() {
+    if (screen == prevScr) return; // Prevent flickering
+
     tft.fillScreen(COL_BG);
     drawHeader("HERMES CORE");
     drawConnDot(true);
@@ -158,6 +160,7 @@ void renderStarting() {
         tft.fillScreen(COL_BG);
         drawHeader("INITIALIZING");
         drawConnDot(true);
+        lastDots = -1; // Force dots redraw
     }
     if (startingDots != lastDots || screen != prevScr) {
         lastDots = startingDots;
@@ -173,68 +176,81 @@ void renderStarting() {
 }
 
 void renderStats() {
+    static int lastMsgs = -1;
+    static int lastTokens = -1;
+    static int lastPct = -1;
+    static bool lastAck = false;
+
     int w = tft.width();
     int h = tft.height();
+    bool force = (screen != prevScr);
+    bool ackActive = (millis() < ackUntilMs && ackText[0]);
 
-    if (screen != prevScr) {
+    if (force) {
         tft.fillScreen(COL_BG);
         drawHeader("SESSION STATS");
         drawConnDot(true);
-        
-        // Vertical divider
         tft.drawFastVLine(w / 2, 35, 60, COL_BAR_BG);
+        lastMsgs = -1; lastTokens = -1; lastPct = -1;
     }
 
-    // Messages (Left Column)
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setTextSize(1);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("MESSAGES", w / 4, 45);
-
-    tft.setTextColor(COL_VALUE, COL_BG);
-    tft.setTextSize(2);
-    char msgBuf[12];
-    snprintf(msgBuf, sizeof(msgBuf), "%d", statsMessages);
-    tft.fillRect(10, 55, (w / 2) - 20, 25, COL_BG);
-    tft.drawString(msgBuf, w / 4, 70);
-
-    // Context tokens (Right Column)
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setTextSize(1);
-    tft.drawString("TOKENS", (w * 3) / 4, 45);
-
-    char tokBuf[24];
-    if (statsTokens >= 1000)
-        snprintf(tokBuf, sizeof(tokBuf), "%d.%dk", statsTokens / 1000, (statsTokens % 1000) / 100);
-    else
-        snprintf(tokBuf, sizeof(tokBuf), "%d", statsTokens);
-
-    tft.setTextColor(COL_VALUE, COL_BG);
-    tft.setTextSize(2);
-    tft.fillRect((w / 2) + 10, 55, (w / 2) - 20, 25, COL_BG);
-    tft.drawString(tokBuf, (w * 3) / 4, 70);
-
-    // Context bar (Bottom)
-    int pct = statsPct < 0 ? 0 : (statsPct > 100 ? 100 : statsPct);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setTextSize(1);
-    tft.setTextDatum(ML_DATUM);
-    tft.drawString("Context", 15, 102);
-    
-    char pctBuf[8];
-    snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
-    tft.setTextDatum(MR_DATUM);
-    tft.drawString(pctBuf, w - 15, 102);
-    
-    drawBar(15, 112, w - 30, 8, pct, COL_ORANGE);
-
-    // Ack banner overlay (if active)
-    if (millis() < ackUntilMs && ackText[0]) {
-        tft.fillRoundRect(20, 45, w - 40, 45, 4, COL_ACK_BG);
-        tft.setTextColor(COL_ACK_TXT, COL_ACK_BG);
+    if (force || statsMessages != lastMsgs) {
+        lastMsgs = statsMessages;
+        tft.setTextColor(COL_LABEL, COL_BG);
         tft.setTextSize(1);
         tft.setTextDatum(MC_DATUM);
-        tft.drawString(ackText, w / 2, 67);
+        tft.drawString("MESSAGES", w / 4, 45);
+        tft.setTextColor(COL_VALUE, COL_BG);
+        tft.setTextSize(2);
+        char msgBuf[12];
+        snprintf(msgBuf, sizeof(msgBuf), "%d", statsMessages);
+        tft.fillRect(10, 55, (w / 2) - 20, 25, COL_BG);
+        tft.drawString(msgBuf, w / 4, 70);
+    }
+
+    if (force || statsTokens != lastTokens) {
+        lastTokens = statsTokens;
+        tft.setTextColor(COL_LABEL, COL_BG);
+        tft.setTextSize(1);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString("TOKENS", (w * 3) / 4, 45);
+        char tokBuf[24];
+        if (statsTokens >= 1000)
+            snprintf(tokBuf, sizeof(tokBuf), "%d.%dk", statsTokens / 1000, (statsTokens % 1000) / 100);
+        else
+            snprintf(tokBuf, sizeof(tokBuf), "%d", statsTokens);
+        tft.setTextColor(COL_VALUE, COL_BG);
+        tft.setTextSize(2);
+        tft.fillRect((w / 2) + 10, 55, (w / 2) - 20, 25, COL_BG);
+        tft.drawString(tokBuf, (w * 3) / 4, 70);
+    }
+
+    int pct = statsPct < 0 ? 0 : (statsPct > 100 ? 100 : statsPct);
+    if (force || pct != lastPct) {
+        lastPct = pct;
+        tft.setTextColor(COL_LABEL, COL_BG);
+        tft.setTextSize(1);
+        tft.setTextDatum(ML_DATUM);
+        tft.drawString("Context", 15, 102);
+        char pctBuf[8];
+        snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
+        tft.setTextDatum(MR_DATUM);
+        tft.drawString(pctBuf, w - 15, 102);
+        drawBar(15, 112, w - 30, 8, pct, COL_ORANGE);
+    }
+
+    if (ackActive || lastAck != ackActive) {
+        lastAck = ackActive;
+        if (ackActive) {
+            tft.fillRoundRect(20, 45, w - 40, 45, 4, COL_ACK_BG);
+            tft.setTextColor(COL_ACK_TXT, COL_ACK_BG);
+            tft.setTextSize(1);
+            tft.setTextDatum(MC_DATUM);
+            tft.drawString(ackText, w / 2, 67);
+        } else if (!force) {
+            // ACK just vanished, need to restore the area underneath
+            lastMsgs = -1; lastTokens = -1; // Trigger redraw of metrics
+        }
     }
 }
 
