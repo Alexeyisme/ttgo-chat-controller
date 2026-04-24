@@ -114,171 +114,170 @@ void sendEvent(const char* name) {
 
 // ── Drawing helpers ───────────────────────────────────────────────────────────
 void drawHeader(const char* title) {
-    tft.fillRect(0, 0, SCREEN_W, 28, COL_HEADER);
-    tft.setTextColor(COL_HEADER_TXT, COL_HEADER);
+    // Elegant floating header (no block bg)
+    tft.setTextColor(COL_HEADER_TXT, COL_BG);
     tft.setTextSize(1);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString(title, SCREEN_W / 2, 14);
+    tft.setTextDatum(ML_DATUM);
+    tft.drawString(title, 10, 14);
 }
 
 void drawBar(int x, int y, int w, int h, int pct, uint16_t col) {
-    tft.fillRect(x, y, w, h, COL_BAR_BG);
+    // Modern segmented bar with rounded corners for the background
+    tft.fillRoundRect(x, y, w, h, 2, COL_BAR_BG);
     int fill = (w * pct) / 100;
-    if (fill > 0) tft.fillRect(x, y, fill, h, col);
-    // Percentage label
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%d%%", pct);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setTextSize(1);
-    tft.setTextDatum(MR_DATUM);
-    tft.drawString(buf, x + w + 28, y + h / 2);
+    if (fill > 0) tft.fillRoundRect(x, y, fill, h, 2, col);
+    
+    // Tiny label above or below could be added if needed, but let's keep it clean
 }
 
 void drawConnDot(bool connected) {
     uint16_t col = connected ? COL_GREEN : COL_RED;
-    tft.fillCircle(SCREEN_W - 8, 14, 4, col);
+    tft.fillCircle(tft.width() - 12, 14, 4, col);
 }
 
 // ── Screen renderers ──────────────────────────────────────────────────────────
 void renderIdle() {
     tft.fillScreen(COL_BG);
-    drawHeader("CHAT CTL");
+    drawHeader("HERMES CORE");
     drawConnDot(true);
+
+    tft.setTextColor(COL_ACCENT, COL_BG);
+    tft.setTextSize(2);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("READY", tft.width() / 2, 60);
 
     tft.setTextColor(COL_LABEL, COL_BG);
     tft.setTextSize(1);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("Press LEFT to", SCREEN_W / 2, 100);
-    tft.drawString("start new chat", SCREEN_W / 2, 116);
-    tft.drawString("Hold RIGHT to", SCREEN_W / 2, 150);
-    tft.drawString("talk (PTT)", SCREEN_W / 2, 166);
+    tft.drawString("Tap TOP for New Chat", tft.width() / 2, 95);
+    tft.drawString("Hold BTM to Talk", tft.width() / 2, 110);
 }
 
 void renderStarting() {
-    // Only redraw the dot line to avoid flicker
     static int lastDots = -1;
     if (screen != prevScr) {
         tft.fillScreen(COL_BG);
-        drawHeader("NEW CHAT");
+        drawHeader("INITIALIZING");
         drawConnDot(true);
     }
     if (startingDots != lastDots || screen != prevScr) {
         lastDots = startingDots;
-        tft.fillRect(0, 90, SCREEN_W, 60, COL_BG);
+        tft.fillRect(0, 50, tft.width(), 60, COL_BG);
         tft.setTextColor(COL_STARTING, COL_BG);
-        tft.setTextSize(1);
+        tft.setTextSize(2);
         tft.setTextDatum(MC_DATUM);
-        tft.drawString("Starting new", SCREEN_W / 2, 100);
-
-        char dotLine[8] = "chat";
-        for (int i = 0; i < (startingDots % 4); i++) dotLine[4 + i] = '.';
-        dotLine[4 + (startingDots % 4)] = '\0';
-        tft.drawString(dotLine, SCREEN_W / 2, 116);
+        
+        char dotLine[16] = "Hermes";
+        for (int i = 0; i < (startingDots % 4); i++) strcat(dotLine, ".");
+        tft.drawString(dotLine, tft.width() / 2, 75);
     }
 }
 
 void renderStats() {
+    int w = tft.width();
+    int h = tft.height();
+
     if (screen != prevScr) {
         tft.fillScreen(COL_BG);
-        drawHeader("CHAT STATS");
+        drawHeader("SESSION STATS");
         drawConnDot(true);
+        
+        // Vertical divider
+        tft.drawFastVLine(w / 2, 35, 60, COL_BAR_BG);
     }
 
-    // Messages
+    // Messages (Left Column)
     tft.setTextColor(COL_LABEL, COL_BG);
     tft.setTextSize(1);
-    tft.setTextDatum(ML_DATUM);
-    tft.drawString("Messages", 8, 52);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("MESSAGES", w / 4, 45);
 
     tft.setTextColor(COL_VALUE, COL_BG);
     tft.setTextSize(2);
-    tft.setTextDatum(MC_DATUM);
     char msgBuf[12];
     snprintf(msgBuf, sizeof(msgBuf), "%d", statsMessages);
-    tft.fillRect(0, 62, SCREEN_W, 22, COL_BG);
-    tft.drawString(msgBuf, SCREEN_W / 2, 73);
+    tft.fillRect(10, 55, (w / 2) - 20, 25, COL_BG);
+    tft.drawString(msgBuf, w / 4, 70);
 
-    // Context tokens
+    // Context tokens (Right Column)
     tft.setTextColor(COL_LABEL, COL_BG);
     tft.setTextSize(1);
-    tft.setTextDatum(ML_DATUM);
-    tft.drawString("Context", 8, 102);
+    tft.drawString("TOKENS", (w * 3) / 4, 45);
 
     char tokBuf[24];
     if (statsTokens >= 1000)
-        snprintf(tokBuf, sizeof(tokBuf), "%dk tok", statsTokens / 1000);
+        snprintf(tokBuf, sizeof(tokBuf), "%d.%dk", statsTokens / 1000, (statsTokens % 1000) / 100);
     else
-        snprintf(tokBuf, sizeof(tokBuf), "%d tok", statsTokens);
+        snprintf(tokBuf, sizeof(tokBuf), "%d", statsTokens);
 
     tft.setTextColor(COL_VALUE, COL_BG);
-    tft.setTextSize(1);
-    tft.setTextDatum(MR_DATUM);
-    tft.fillRect(0, 96, SCREEN_W - 30, 14, COL_BG);
-    tft.drawString(tokBuf, SCREEN_W - 32, 103);
+    tft.setTextSize(2);
+    tft.fillRect((w / 2) + 10, 55, (w / 2) - 20, 25, COL_BG);
+    tft.drawString(tokBuf, (w * 3) / 4, 70);
 
-    // Context bar
+    // Context bar (Bottom)
     int pct = statsPct < 0 ? 0 : (statsPct > 100 ? 100 : statsPct);
-    drawBar(8, 118, 88, 10, pct, COL_ORANGE);
-
-    // Stale indicator
-    if (statsStale) {
-        tft.setTextColor(0x632C, COL_BG);
-        tft.setTextSize(1);
-        tft.setTextDatum(MC_DATUM);
-        tft.drawString("stale", SCREEN_W / 2, 144);
-    } else {
-        tft.fillRect(0, 138, SCREEN_W, 14, COL_BG);
-    }
-
-    // Ack banner
-    if (millis() < ackUntilMs && ackText[0]) {
-        tft.fillRect(0, 158, SCREEN_W, 18, 0x07E0); // green bg
-        tft.setTextColor(COL_BG, 0x07E0);
-        tft.setTextSize(1);
-        tft.setTextDatum(MC_DATUM);
-        tft.drawString(ackText, SCREEN_W / 2, 167);
-    } else {
-        tft.fillRect(0, 158, SCREEN_W, 18, COL_BG);
-    }
-
-    // Hint
     tft.setTextColor(COL_LABEL, COL_BG);
     tft.setTextSize(1);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("Hold RIGHT: talk", SCREEN_W / 2, 210);
-    tft.drawString("LEFT: new chat", SCREEN_W / 2, 224);
+    tft.setTextDatum(ML_DATUM);
+    tft.drawString("Context", 15, 102);
+    
+    char pctBuf[8];
+    snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
+    tft.setTextDatum(MR_DATUM);
+    tft.drawString(pctBuf, w - 15, 102);
+    
+    drawBar(15, 112, w - 30, 8, pct, COL_ORANGE);
+
+    // Ack banner overlay (if active)
+    if (millis() < ackUntilMs && ackText[0]) {
+        tft.fillRoundRect(20, 45, w - 40, 45, 4, COL_ACK_BG);
+        tft.setTextColor(COL_ACK_TXT, COL_ACK_BG);
+        tft.setTextSize(1);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString(ackText, w / 2, 67);
+    }
 }
 
 void renderPtt() {
+    int w = tft.width();
+    int h = tft.height();
+
     if (screen != prevScr) {
         tft.fillScreen(COL_PTT_BG);
         drawHeader("LISTENING");
         drawConnDot(true);
-        // Mic icon (simple circle + stand)
-        tft.drawCircle(SCREEN_W / 2, 85, 18, COL_PTT_WAVE);
-        tft.drawCircle(SCREEN_W / 2, 85, 17, COL_PTT_WAVE);
-        tft.drawFastVLine(SCREEN_W / 2, 103, 12, COL_PTT_WAVE);
-        tft.drawLine(SCREEN_W / 2 - 10, 115, SCREEN_W / 2 + 10, 115, COL_PTT_WAVE);
+        
+        // Mic icon
+        int cx = w / 2;
+        int cy = 45; // Moved up slightly for landscape
+        tft.fillRoundRect(cx - 8, cy - 15, 16, 25, 8, COL_PTT_WAVE);
+        tft.drawCircle(cx, cy, 18, COL_PTT_WAVE);
+        tft.drawFastVLine(cx, cy + 18, 5, COL_PTT_WAVE);
+        tft.drawFastHLine(cx - 10, cy + 23, 20, COL_PTT_WAVE);
+
         tft.setTextColor(COL_PTT_WAVE, COL_PTT_BG);
         tft.setTextSize(1);
         tft.setTextDatum(MC_DATUM);
-        tft.drawString("Release to send", SCREEN_W / 2, 210);
+        tft.drawString("RELEASE TO SEND", w / 2, h - 15);
     }
 
     // Animated waveform bars
     if (millis() - lastAnimMs > ANIMATION_TICK_MS) {
         lastAnimMs = millis();
         wavePhase  = (wavePhase + 1) % 8;
-        const int heights[] = {6, 12, 20, 28, 20, 12, 6, 4};
-        int barW = 8, gap = 4;
-        int totalW = 5 * barW + 4 * gap;
-        int startX = (SCREEN_W - totalW) / 2;
-        int baseY  = 160;
-        tft.fillRect(0, baseY - 30, SCREEN_W, 62, COL_PTT_BG);
-        for (int i = 0; i < 5; i++) {
-            int h = heights[(wavePhase + i) % 8];
+        const int heights[] = {8, 16, 28, 40, 28, 16, 8, 6};
+        int numBars = 9;
+        int barW = 10, gap = 6;
+        int totalW = numBars * barW + (numBars - 1) * gap;
+        int startX = (w - totalW) / 2;
+        int baseY  = h - 50; 
+        
+        tft.fillRect(0, baseY - 22, w, 45, COL_PTT_BG);
+        
+        for (int i = 0; i < numBars; i++) {
+            int currentH = heights[(wavePhase + i) % 8];
             int x = startX + i * (barW + gap);
-            tft.fillRoundRect(x, baseY - h / 2, barW, h, 2, COL_PTT_WAVE);
+            tft.fillRoundRect(x, baseY - currentH / 2, barW, currentH, 3, COL_PTT_WAVE);
         }
     }
 }
