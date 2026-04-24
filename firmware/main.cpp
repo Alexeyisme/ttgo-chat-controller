@@ -232,18 +232,18 @@ void renderStats() {
         tft.setTextColor(COL_LABEL, COL_BG);
         tft.setTextSize(1);
         tft.setTextDatum(ML_DATUM);
-        tft.drawString("Context", 15, 102);
+        tft.drawString("Context", 15, 107);
         char pctBuf[8];
         snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
         tft.setTextDatum(MR_DATUM);
-        tft.drawString(pctBuf, w - 15, 102);
-        drawBar(15, 112, w - 30, 8, pct, COL_ORANGE);
+        tft.drawString(pctBuf, w - 15, 107);
+        drawBar(15, 117, w - 30, 8, pct, COL_ORANGE);
     }
 
     if (ackActive || lastAck != ackActive) {
         lastAck = ackActive;
-        // Clear or draw the status region (y=88 to 98)
-        tft.fillRect(15, 88, w - 30, 12, COL_BG); 
+        // Clear status region (y=86 to 98) — stays away from "Context" at 107
+        tft.fillRect(15, 86, w - 30, 14, COL_BG); 
         
         if (ackActive) {
             tft.setTextColor(COL_ACCENT, COL_BG);
@@ -251,7 +251,7 @@ void renderStats() {
             tft.setTextDatum(ML_DATUM);
             char statusBuf[40];
             snprintf(statusBuf, sizeof(statusBuf), "> %s", ackText);
-            tft.drawString(statusBuf, 15, 93);
+            tft.drawString(statusBuf, 15, 91);
         }
     }
 }
