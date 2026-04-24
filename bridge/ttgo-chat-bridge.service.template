@@ -10,8 +10,8 @@ WorkingDirectory=__PROJECT_DIR__/bridge
 EnvironmentFile=-__HERMES_ENV__
 EnvironmentFile=-__PROJECT_DIR__/bridge/.env
 ExecStart=__PROJECT_DIR__/bridge/.venv/bin/python ttgo_chat_bridge.py
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=2
 SupplementaryGroups=audio dialout
 
 [Install]

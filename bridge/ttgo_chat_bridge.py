@@ -48,6 +48,9 @@ import serial
 # ── Config ────────────────────────────────────────────────────────────────────
 SERIAL_PORT   = os.getenv("TTGO_CHAT_PORT",  "/dev/ttyACM0")
 SERIAL_BAUD   = int(os.getenv("TTGO_CHAT_BAUD", "115200"))
+# Optional: identify the TTGO by USB serial number so we survive /dev/ttyACM{N}
+# renumbering across disconnect/reconnect even without a udev symlink.
+SERIAL_USB_ID = os.getenv("TTGO_CHAT_USB_SERIAL", "537A038767")
 
 API_BASE      = os.getenv("HERMES_API_BASE",  "http://localhost:8642")
 API_KEY       = os.getenv("HERMES_API_KEY",   "")
@@ -120,39 +123,165 @@ def mark_chat_block(seconds: float = 3.0):
 
 
 # ── Serial transport ──────────────────────────────────────────────────────────
+def find_ttgo_port(preferred: str, usb_serial: Optional[str]) -> Optional[str]:
+    """Locate the TTGO serial device. Prefer `preferred` if present; otherwise
+    scan pyserial's list_ports for a device whose USB serial number matches
+    `usb_serial`. Returns a device path or None."""
+    try:
+        if preferred and os.path.exists(preferred):
+            return preferred
+    except Exception:
+        pass
+    if not usb_serial:
+        return None
+    try:
+        from serial.tools import list_ports
+        for p in list_ports.comports():
+            sn = (getattr(p, "serial_number", None) or "").strip()
+            if sn and sn == usb_serial:
+                return p.device
+    except Exception as e:
+        log.debug("list_ports error: %s", e)
+    return None
+
+
 class SerialTransport:
-    def __init__(self, port: str, baud: int):
+    """Serial transport with transparent auto-reconnect.
+
+    - `send()` and `readline()` tolerate the port being disconnected. They
+      return silently (send) / return None (readline) while the port is down.
+    - A background reconnect thread keeps trying to re-open the port, either
+      at the configured path or via USB-serial discovery. Once reconnected,
+      callers continue transparently.
+    """
+
+    def __init__(self, port: str, baud: int, usb_serial: Optional[str] = None):
         self._ser: Optional[serial.Serial] = None
         self.port = port
         self.baud = baud
-        self._lock = threading.Lock()
+        self.usb_serial = usb_serial
+        self._lock = threading.Lock()          # protects self._ser for writes
+        self._state_lock = threading.Lock()    # protects connected flag
+        self._connected = False
+        self._stop = threading.Event()
+        self._on_reconnect = None  # callback(transport) after a reconnect
 
-    def connect(self):
-        self._ser = serial.Serial(self.port, self.baud, timeout=0.1)
-        log.info("Serial connected: %s @ %d", self.port, self.baud)
+    def set_on_reconnect(self, cb):
+        self._on_reconnect = cb
 
-    def send(self, obj: dict):
-        line = json.dumps(obj) + "\n"
+    def _open(self, path: str) -> bool:
+        try:
+            ser = serial.Serial(path, self.baud, timeout=0.1)
+        except Exception as e:
+            log.debug("open %s failed: %s", path, e)
+            return False
+        with self._lock:
+            self._ser = ser
+            self.port = path
+        with self._state_lock:
+            self._connected = True
+        log.info("Serial connected: %s @ %d", path, self.baud)
+        return True
+
+    def connect(self, blocking: bool = True):
+        """Initial connect. If blocking=True, keep retrying until we succeed
+        or stop() is called. Uses port discovery by USB serial as a fallback."""
+        backoff = 1.0
+        while not self._stop.is_set():
+            path = find_ttgo_port(self.port, self.usb_serial)
+            if path and self._open(path):
+                return
+            if not blocking:
+                return
+            log.warning("TTGO not found (looking for %s or USB serial %s). "
+                        "Retrying in %.1fs", self.port, self.usb_serial, backoff)
+            if self._stop.wait(backoff):
+                return
+            backoff = min(backoff * 1.6, 10.0)
+
+    @property
+    def connected(self) -> bool:
+        with self._state_lock:
+            return self._connected and self._ser is not None and self._ser.is_open
+
+    def _mark_disconnected(self, reason: str = ""):
+        with self._state_lock:
+            was = self._connected
+            self._connected = False
+        if was:
+            log.warning("Serial disconnected (%s); entering reconnect loop", reason or "unknown")
         with self._lock:
             try:
-                self._ser.write(line.encode())
-                self._ser.flush()
+                if self._ser and self._ser.is_open:
+                    self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
+    def _reconnect_loop(self):
+        """Try to reopen the port. Prefer same path; fall back to USB-serial match."""
+        backoff = 1.0
+        while not self._stop.is_set() and not self.connected:
+            path = find_ttgo_port(self.port, self.usb_serial)
+            if path and self._open(path):
+                cb = self._on_reconnect
+                if cb:
+                    try:
+                        cb(self)
+                    except Exception as e:
+                        log.error("on_reconnect callback error: %s", e)
+                return
+            if self._stop.wait(backoff):
+                return
+            backoff = min(backoff * 1.6, 10.0)
+
+    def send(self, obj: dict):
+        if not self.connected:
+            log.debug("send dropped (disconnected): %s", obj.get("type"))
+            return
+        line = json.dumps(obj) + "\n"
+        with self._lock:
+            ser = self._ser
+            if ser is None:
+                return
+            try:
+                ser.write(line.encode())
+                ser.flush()
                 log.debug("→ %s", line.strip())
             except Exception as e:
                 log.error("Serial send error: %s", e)
+                self._mark_disconnected(str(e))
 
     def readline(self) -> Optional[str]:
+        if not self.connected:
+            # Passive reconnect attempt driven by the main loop; cheap.
+            self._reconnect_loop()
+            return None
         try:
-            raw = self._ser.readline()
+            ser = self._ser
+            if ser is None:
+                return None
+            raw = ser.readline()
             if raw:
                 return raw.decode(errors="replace").strip()
-        except Exception:
-            pass
+        except (serial.SerialException, OSError) as e:
+            self._mark_disconnected(str(e))
+        except Exception as e:
+            log.debug("readline error: %s", e)
         return None
 
     def close(self):
-        if self._ser and self._ser.is_open:
-            self._ser.close()
+        self._stop.set()
+        with self._lock:
+            try:
+                if self._ser and self._ser.is_open:
+                    self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+        with self._state_lock:
+            self._connected = False
+
 
 # ── TTS → BT speaker ─────────────────────────────────────────────────────────
 def speak(text: str):
@@ -283,8 +412,20 @@ def handle_new_chat(transport: SerialTransport):
     global chat_starting
     with chat_start_lock:
         if chat_starting or not chat_start_allowed():
-            log.info("Ignoring duplicate new_chat while starting/blocking")
-            transport.send({"type": "ack", "text": "Starting..."})
+            log.info("Ignoring duplicate new_chat while starting/blocking — resyncing display")
+            # Re-sync display so firmware doesn't time out in SCR_STARTING
+            sid = state.sid
+            if sid:
+                transport.send({"type": "chat_started", "session_id": sid})
+                transport.send({
+                    "type":        "chat_stats",
+                    "messages":    state.messages,
+                    "tokens":      state.tokens,
+                    "context_pct": state.context_pct(),
+                })
+                transport.send({"type": "ack", "text": "Already started"})
+            else:
+                transport.send({"type": "ack", "text": "Starting..."})
             return
         chat_starting = True
 
@@ -390,7 +531,10 @@ def run(transport: SerialTransport):
     while True:
         line = transport.readline()
         if not line:
-            time.sleep(0.01)
+            # When disconnected, readline() returns quickly after a reconnect
+            # attempt; sleep a bit to avoid a hot loop. When connected but
+            # idle, the pyserial timeout already throttles us.
+            time.sleep(0.05 if not transport.connected else 0.01)
             continue
 
         log.debug("← %s", line)
@@ -443,8 +587,19 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    transport = SerialTransport(args.port, args.baud)
-    transport.connect()
+    transport = SerialTransport(args.port, args.baud, usb_serial=SERIAL_USB_ID)
+
+    # After a reconnect, send a fresh "Bridge OK" ack so the TTGO knows
+    # we're back. The TTGO firmware also sends its own device_ready on
+    # boot/reset, which will trigger the normal hello path too.
+    def _on_reconnect(t):
+        try:
+            t.send({"type": "ack", "text": "Bridge OK"})
+        except Exception:
+            pass
+    transport.set_on_reconnect(_on_reconnect)
+
+    transport.connect(blocking=True)
 
     def _shutdown(sig, frame):
         log.info("Shutting down")

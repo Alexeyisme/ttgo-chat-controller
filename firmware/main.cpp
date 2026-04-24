@@ -504,14 +504,17 @@ void loop() {
     // ── BTN2 — new chat ───────────────────────────────────────────────────────
     if (btn2Fired) {
         btn2Fired = false;
-        if (!newChatPending && screen != SCR_STARTING) {
+        unsigned long now = millis();
+        // Debounce against bounces/EMI: ignore fresh presses within 1s of last accepted one.
+        bool cooldownOk = (newChatPressAcceptedMs == 0) || (now - newChatPressAcceptedMs) > 1000;
+        if (!newChatPending && screen != SCR_STARTING && cooldownOk) {
             newChatPending = true;
-            newChatPendingSinceMs = millis();
-            newChatPressAcceptedMs = millis();
+            newChatPendingSinceMs = now;
+            newChatPressAcceptedMs = now;
             newChatSeq++;
             screen    = SCR_STARTING;
             startingDots = 0;
-            lastDotMs    = millis();
+            lastDotMs    = now;
             prevScr      = SCR_STATS; // force full redraw on next tick
             sendEvent("new_chat");
         }
@@ -519,8 +522,10 @@ void loop() {
 
     if (newChatPending && (millis() - newChatPendingSinceMs) > STARTING_TIMEOUT_MS) {
         newChatPending = false;
-        screen = SCR_IDLE;
+        // If we already have an active session, fall back to stats, not idle
+        screen = (statsMessages > 0) ? SCR_STATS : SCR_IDLE;
         prevScr = SCR_STARTING;
+        startingSinceMs = 0;
     }
 
     displayTick();
