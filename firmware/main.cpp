@@ -242,15 +242,16 @@ void renderStats() {
 
     if (ackActive || lastAck != ackActive) {
         lastAck = ackActive;
+        // Clear or draw the status region (y=88 to 98)
+        tft.fillRect(15, 88, w - 30, 12, COL_BG); 
+        
         if (ackActive) {
-            tft.fillRoundRect(20, 45, w - 40, 45, 4, COL_ACK_BG);
-            tft.setTextColor(COL_ACK_TXT, COL_ACK_BG);
+            tft.setTextColor(COL_ACCENT, COL_BG);
             tft.setTextSize(1);
-            tft.setTextDatum(MC_DATUM);
-            tft.drawString(ackText, w / 2, 67);
-        } else if (!force) {
-            // ACK just vanished, need to restore the area underneath
-            lastMsgs = -1; lastTokens = -1; // Trigger redraw of metrics
+            tft.setTextDatum(ML_DATUM);
+            char statusBuf[40];
+            snprintf(statusBuf, sizeof(statusBuf), "> %s", ackText);
+            tft.drawString(statusBuf, 15, 93);
         }
     }
 }
