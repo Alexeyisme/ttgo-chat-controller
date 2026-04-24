@@ -29,9 +29,10 @@ enum ScreenState {
     SCR_STARTING,   // "STARTING NEW CHAT…" animation
     SCR_STATS,      // Chat stats: messages + context
     SCR_PTT,        // PTT overlay (during recording)
+    SCR_NONE,       // Used to force first redraw
 };
 ScreenState screen    = SCR_IDLE;
-ScreenState prevScr   = SCR_IDLE;
+ScreenState prevScr   = SCR_NONE;
 
 // Chat stats
 int  statsMessages    = 0;

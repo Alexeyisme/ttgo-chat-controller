@@ -2,10 +2,12 @@
 
 A tiny hardware **voice chat controller** for [Hermes Agent](https://github.com/hypernym-ai/hermes-agent). Press a button, talk to your AI. Release the button and hear it talk back. The TFT display shows session stats, token count, and a context-usage bar — no keyboard, no screen, no phone.
 
+**Now with a premium landscape-optimized UI overhaul!**
+
 ```
 ┌──────────────────────┐        USB          ┌──────────────────────────┐
 │   TTGO T-Display     │ ─── serial, 115200 ─│   Bridge (Python)        │
-│   ESP32 + TFT + 2 btn│                     │   ttgo_chat_bridge.py    │
+│      (LANDSCAPE)     │                     │   ttgo_chat_bridge.py    │
 └──────────────────────┘                     └────────────┬─────────────┘
                                                           │
                                ┌──────────────┬───────────┼──────────────────┐
@@ -22,10 +24,12 @@ A tiny hardware **voice chat controller** for [Hermes Agent](https://github.com/
 
 ## Features
 
-- **LEFT button → new chat** — fresh Hermes session, one tap
-- **RIGHT button → push-to-talk** — hold, speak, release; transcribed and sent to Hermes, reply spoken back
-- **TFT display states** — idle hints → starting animation → live stats (messages · tokens · context %) → listening waveform
-- **Zero WiFi config on the device** — all talk happens over USB serial
+- **Landscape Dashboard** — Optimized 240x135 layout for a more professional desktop look.
+- **TOP button → new chat** — Tap the top button (GPIO 0) to start a fresh Hermes session.
+- **BTM button → push-to-talk** — Hold the bottom button (GPIO 35) speak, release to send.
+- **Modernized Aesthetics** — Neon Cyan/Green theme with high-contrast stats and rounded context bars.
+- **Animated Waveform** — Live 9-bar voice animation during recording fills the wide screen.
+- **Zero WiFi config on the device** — All communication happens over USB serial.
 - **Runs as a systemd service** — `sudo systemctl restart ttgo-chat-bridge`
 
 ---
@@ -129,11 +133,13 @@ Hold RIGHT, say "hello", release. You should hear Hermes respond over your speak
 
 | Function        | GPIO  | Notes                                            |
 |-----------------|-------|--------------------------------------------------|
-| LEFT button     | 35    | **Input only**, no pull-up — new chat on tap     |
-| RIGHT button    | 0     | Has internal pull-up. Hold ≥250 ms → PTT start   |
+| TOP button      | 0     | New chat on tap. High reliability.               |
+| BTM button      | 35    | **Input only**, no pull-up. Hold ≥250 ms → PTT.  |
 | TFT backlight   | 4     | Driven by TFT_eSPI                               |
 
-GPIO 0 is an ESP32 boot-strap pin. Holding it during reset enters the ROM bootloader, so we use polling + debounce rather than interrupts and a 20 ms raw settle window before treating the edge as pressed.
+**Orientation:** The device is configured for **landscape mode** with the buttons on the left.
+- **GPIO 0** is the **Upper** button.
+- **GPIO 35** is the **Lower** button.
 
 Works with any USB microphone. Tested extensively with a Logitech C920 (as `hw:3,0`) and a generic ATOP6868 Bluetooth A2DP speaker via `bluealsa`. A 3.5 mm jack + `default` also works fine.
 
