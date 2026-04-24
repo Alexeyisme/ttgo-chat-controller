@@ -50,7 +50,7 @@ SERIAL_PORT   = os.getenv("TTGO_CHAT_PORT",  "/dev/ttyACM0")
 SERIAL_BAUD   = int(os.getenv("TTGO_CHAT_BAUD", "115200"))
 # Optional: identify the TTGO by USB serial number so we survive /dev/ttyACM{N}
 # renumbering across disconnect/reconnect even without a udev symlink.
-SERIAL_USB_ID = os.getenv("TTGO_CHAT_USB_SERIAL", "537A038767")
+SERIAL_USB_ID = os.getenv("TTGO_CHAT_USB_SERIAL", None)
 
 API_BASE      = os.getenv("HERMES_API_BASE",  "http://localhost:8642")
 API_KEY       = os.getenv("HERMES_API_KEY",   "")
