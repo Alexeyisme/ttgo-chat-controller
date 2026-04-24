@@ -1,0 +1,18 @@
+[Unit]
+Description=TTGO Chat Controller Bridge
+After=network.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__PROJECT_DIR__/bridge
+EnvironmentFile=-__HERMES_ENV__
+EnvironmentFile=-__PROJECT_DIR__/bridge/.env
+ExecStart=__PROJECT_DIR__/bridge/.venv/bin/python ttgo_chat_bridge.py
+Restart=on-failure
+RestartSec=5
+SupplementaryGroups=audio dialout
+
+[Install]
+WantedBy=multi-user.target

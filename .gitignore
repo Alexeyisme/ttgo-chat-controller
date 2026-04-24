@@ -1,0 +1,33 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+*.hex
+*.bin
+*.elf
+
+# PlatformIO's `src/` requirement — this is a symlink to firmware/ created by install.sh
+src
+
+# Python
+bridge/.venv/
+bridge/__pycache__/
+bridge/**/__pycache__/
+bridge/*.pyc
+bridge/logs/
+
+# Local env / secrets
+.env
+bridge/.env
+*.local
+
+# Local systemd unit (generated from template)
+bridge/ttgo-chat-bridge.service
+!bridge/ttgo-chat-bridge.service.template
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
