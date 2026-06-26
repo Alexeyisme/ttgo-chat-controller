@@ -1,5 +1,5 @@
+# The bridge itself only needs HTTP + serial. STT and TTS are delegated to
+# hermes-agent (tools.transcription_tools / tools.tts_tool), whose own venv
+# provides the provider SDKs (groq/openai/edge-tts/etc.) per ~/.hermes/config.yaml.
 requests>=2.31.0
 pyserial>=3.5
-groq>=0.11.0
-openai>=1.40.0
-edge-tts>=6.1.9

@@ -18,7 +18,6 @@
 #define BTN2_HOLD_MS    250         // ms hold before PTT activates
 #define BTN2_RAW_SETTLE_MS 20
 #define BTN2_LOG_EVERY_MS 500
-#define NEW_CHAT_COOLDOWN_MS 1200
 #define STARTING_TIMEOUT_MS  8000
 
 // ── Context window assumption (tokens) ─────────────────────────────────────────
@@ -28,7 +27,6 @@
 // ── Colors (RGB565) ────────────────────────────────────────────────────────────
 #define COL_BG          0x0000      // Black
 #define COL_ACCENT      0x07FF      // Cyan
-#define COL_HEADER      0x0000      // Transparent/Black header
 #define COL_HEADER_TXT  0x7BEF      // Light gray secondary
 #define COL_LABEL       0xBDD7      // Muted blue/gray
 #define COL_VALUE       0xFFFF      // White
@@ -40,8 +38,6 @@
 #define COL_PTT_BG      0x0000
 #define COL_PTT_WAVE    0x07FF      // Cyan pulses
 #define COL_STARTING    0x07FF      // Cyan "STARTING" text
-#define COL_ACK_BG      0x07E0      // Green banner
-#define COL_ACK_TXT     0x0000      // Black text on green
 
 // ── Timing ─────────────────────────────────────────────────────────────────────
 #define ANIMATION_TICK_MS   80      // Slightly faster animations

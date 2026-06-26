@@ -1,18 +1,30 @@
 [Unit]
-Description=TTGO Chat Controller Bridge
-After=network.target sound.target
+# USER-SCOPE unit. The bridge uses PipeWire (pw-record/pw-play) for audio, so it
+# must run inside your user's PipeWire session — install under
+# ~/.config/systemd/user/ and enable linger (loginctl enable-linger $USER).
+# A system-scope unit has no PipeWire session and audio will silently fail.
+Description=TTGO Chat Controller Bridge (user scope — needs PipeWire session)
+After=pipewire.service network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=__USER__
 WorkingDirectory=__PROJECT_DIR__/bridge
+# Run in the hermes-agent venv so tools.transcription_tools / tools.tts_tool
+# (and their provider SDKs) import. HERMES_AGENT_ROOT points imports at the repo.
+Environment=HERMES_AGENT_ROOT=__HERMES_AGENT_ROOT__
+Environment=PYTHONUNBUFFERED=1
+# '-' = optional; loads HERMES_API_KEY / HERMES_API_BASE / serial config etc.
 EnvironmentFile=-__HERMES_ENV__
 EnvironmentFile=-__PROJECT_DIR__/bridge/.env
-ExecStart=__PROJECT_DIR__/bridge/.venv/bin/python ttgo_chat_bridge.py
+ExecStart=__HERMES_AGENT_VENV__/bin/python ttgo_chat_bridge.py
 Restart=always
-RestartSec=2
-SupplementaryGroups=audio dialout
+RestartSec=3
+# Clean cgroup teardown so pw-record/pw-play children don't linger on stop.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=5
+SendSIGKILL=yes
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

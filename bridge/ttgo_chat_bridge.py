@@ -14,7 +14,6 @@ Protocol (115200 baud, newline-delimited JSON):
 """
 
 import argparse
-import asyncio
 import json
 import logging
 import os
@@ -31,8 +30,9 @@ from typing import Optional
 # Make hermes-agent importable when running this bridge standalone.
 # Layout assumption (default): this repo sits next to or inside a Hermes checkout.
 #   - HERMES_AGENT_ROOT env var (absolute path to the hermes-agent repo) — preferred
-#   - Otherwise fall back to parents[3], which matches the layout where ttgo-chat
-#     lives as a subdirectory of hermes-agent (…/hermes-agent/ttgo-chat/bridge/).
+#   - Otherwise fall back to parents[2] (…/<repo>/bridge/ → <repo>'s parent),
+#     which matches the layout where ttgo-chat lives as a subdirectory of
+#     hermes-agent (…/hermes-agent/ttgo-chat/bridge/).
 _env_root = os.getenv("HERMES_AGENT_ROOT")
 if _env_root:
     HERMES_REPO_ROOT = Path(_env_root).expanduser().resolve()
@@ -57,21 +57,17 @@ API_KEY       = os.getenv("HERMES_API_KEY",   "")
 API_MODEL     = os.getenv("HERMES_API_MODEL", "hermes-agent")
 CTX_WINDOW    = int(os.getenv("CTX_WINDOW_TOKENS", "200000"))
 
-GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
+# STT and TTS are delegated to hermes-agent (tools.transcription_tools /
+# tools.tts_tool), which read provider + voice from ~/.hermes/config.yaml.
+# The bridge holds no STT/TTS keys and selects no voice of its own.
 
-# Audio hardware — WM8960 Audio HAT is the ONLY supported output/input.
-# No Bluetooth. When the WM8960 is present it is used for ALL sound flows.
-MIC_DEVICE    = os.getenv("TTGO_MIC_DEVICE", "plughw:wm8960soundcard,0")   # ALSA capture device
-AUDIO_DEVICE  = os.getenv("TTGO_AUDIO_DEVICE", "plughw:wm8960soundcard,0") # ALSA playback device (WM8960)
+# Audio follows the SYSTEM DEFAULTS via PipeWire: capture uses the default
+# source (pw-record, see PttRecorder), playback uses the default sink (pw-play,
+# see speak()). Swap the mic or speaker — or remove the WM8960 HAT and use the
+# Pi's 3.5 mm jack — and the bridge follows with no config change.
+# Loudness is governed by the system volume control (PipeWire default-sink
+# volume); the bridge applies no gain of its own.
 RECORD_RATE   = 16000
-
-# TTS
-TTS_VOICE     = os.getenv("TTGO_TTS_VOICE", "en-US-AvaMultilingualNeural")
-
-# System volume — the ONLY volume control. WM8960 'Speaker' mixer (0-127).
-# Enforced before EVERY playback so greeting and response are always equally
-# loud regardless of what the capture cycle did to the codec. No software gain.
-SYSTEM_VOLUME = os.getenv("TTGO_SYSTEM_VOLUME", "120")
 
 log = logging.getLogger("ttgo-chat")
 
@@ -94,6 +90,19 @@ class ChatState:
         with self._lock:
             self.messages = messages
             self.tokens   = tokens
+
+    def apply_result(self, result: dict, *, messages: Optional[int] = None,
+                     increment: bool = False):
+        """Adopt the server-echoed session id and token count from a Hermes API
+        result. Set `messages` to a fixed value (e.g. 1 for a greeting) or pass
+        `increment=True` to bump the existing counter by one."""
+        with self._lock:
+            self.session_id = result["session_id"]
+            self.tokens     = result["prompt_tokens"]
+            if messages is not None:
+                self.messages = messages
+            elif increment:
+                self.messages += 1
 
     def increment_messages(self):
         with self._lock:
@@ -289,95 +298,74 @@ class SerialTransport:
             self._connected = False
 
 
-# ── TTS → WM8960 speaker ─────────────────────────────────────────────────────
+# ── TTS → PipeWire (WM8960 default sink) ─────────────────────────────────────
 def speak(text: str):
-    """Convert text to speech and play on the WM8960 speaker (ALSA)."""
+    """Synthesize via hermes-agent's TTS, then play through the default sink.
+
+    TTS uses hermes-agent's `text_to_speech_tool` — provider and voice come
+    from `~/.hermes/config.yaml` (`tts:` section), the same settings as the
+    rest of Hermes. The bridge passes no API key and picks no voice of its own.
+
+    Playback goes through PipeWire's default sink, so loudness is governed by
+    the system volume control (`wpctl set-volume @DEFAULT_AUDIO_SINK@ …` / the
+    desktop slider). The bridge applies NO gain of its own.
+    """
     if not text.strip():
         return
-    # Truncate very long responses for speech
-    words = text.split()
-    if len(words) > 80:
-        text = " ".join(words[:80]) + "…"
 
-    log.info("TTS: %d chars → %s", len(text), AUDIO_DEVICE)
+    log.info("TTS (hermes-agent): %d chars", len(text))
+    audio_path = None
+    wav_path = None
     try:
-        import edge_tts
-        fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+        from tools.tts_tool import text_to_speech_tool
+        raw = text_to_speech_tool(text=text)
+        # Returns a JSON string with success + file_path (may carry a MEDIA: tag).
+        try:
+            result = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except (json.JSONDecodeError, TypeError):
+            result = {}
+        audio_path = result.get("file_path") or result.get("output_path")
+        if not result.get("success", bool(audio_path)) or not audio_path \
+                or not os.path.exists(audio_path):
+            log.error("TTS synth failed: %s", result.get("error") or raw)
+            return
+
+        # Normalise to wav for pw-play (libsndfile reads wav/ogg/flac, not mp3).
+        fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="tts_")
         os.close(fd)
-
-        async def _synthesize():
-            comm = edge_tts.Communicate(text, TTS_VOICE)
-            await comm.save(mp3_path)
-
-        asyncio.run(_synthesize())
-
-        # ffmpeg mp3 → wav, then aplay to the WM8960 ALSA device
-        fd2, wav_path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd2)
-
-        # Convert mp3 → wav
         subprocess.run(
-            ["ffmpeg", "-y", "-i", mp3_path, "-ar", "44100", "-ac", "2", wav_path],
+            ["ffmpeg", "-y", "-i", audio_path, "-ar", "44100", "-ac", "2", wav_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
         )
-        os.unlink(mp3_path)
 
-        # SYSTEM VOLUME ENFORCEMENT — the single source of loudness.
-        # Set BEFORE every playback so greeting and post-capture response are
-        # always equally loud. 'Speaker' is the system volume; 'Playback' (DAC)
-        # is pinned to unity so Speaker is the only effective control.
-        for ctrl, val in (("Playback", "255"), ("Speaker", SYSTEM_VOLUME)):
-            r = subprocess.run(
-                ["amixer", "-c", "wm8960soundcard", "sset", ctrl, val],
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-            )
-            if r.returncode != 0:
-                log.warning("amixer sset %s %s failed (rc=%d): %s", ctrl, val,
-                            r.returncode, r.stderr.decode(errors="replace") if r.stderr else "?")
-        log.info("System volume enforced: Speaker=%s Playback=255", SYSTEM_VOLUME)
-
-        # Kick the PCM device open/closed to force a fresh codec path after
-        # capture. The WM8960 is half-duplex over I2S; a capture-then-playback
-        # transition can leave internal routing stuck even though amixer
-        # controls look correct.
-        try:
-            subprocess.run(
-                ["aplay", "-D", AUDIO_DEVICE, "-d", "0", "/dev/zero"],
-                timeout=0.3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except (subprocess.TimeoutExpired, Exception):
-            pass
-
-        # Play wav on speaker. Capture device may still be settling after PTT
-        # (PipeWire/ALSA half-duplex race) → retry on "device busy".
-        played = False
-        for attempt in range(4):
-            res = subprocess.run(
-                ["aplay", "-D", AUDIO_DEVICE, wav_path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            if res.returncode == 0:
-                played = True
-                log.info("aplay attempt %d succeeded (rc=0)", attempt + 1)
-                break
-            err = (res.stderr or b"").decode(errors="replace").strip()
-            log.warning("aplay attempt %d failed (rc=%d): %s", attempt + 1, res.returncode, err)
-            time.sleep(0.4)
-        os.unlink(wav_path)
-        if played:
+        # Play through PipeWire's default sink. PipeWire serialises access, so
+        # there's no half-duplex device-busy race to retry around.
+        res = subprocess.run(
+            ["pw-play", wav_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        if res.returncode == 0:
             log.info("TTS playback done")
         else:
-            log.error("TTS playback FAILED after retries on %s", AUDIO_DEVICE)
+            err = (res.stderr or b"").decode(errors="replace").strip()
+            log.error("TTS playback FAILED (rc=%d): %s", res.returncode, err)
 
     except Exception as e:
         log.error("TTS error: %s", e)
+    finally:
+        for p in (wav_path, audio_path):
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
 
-# ── PTT recorder (direct ALSA via arecord) ────────────────────────────────────
-# Uses arecord on the WM8960 directly. The PipeWire-based voice_mode recorder
-# left the half-duplex I2S capture stream RUNNING after stop(), which attenuated
-# subsequent playback (loud greeting, quiet responses). arecord is a child
-# process we fully terminate, guaranteeing the capture path is released before
-# we play the TTS response back on the same codec.
+# ── PTT recorder (PipeWire default source) ────────────────────────────────────
+# Captures via pw-record through PipeWire's DEFAULT source, so whatever the OS
+# has selected as the system microphone is used — swap the mic (or remove the
+# WM8960) and capture follows with no bridge change. pw-record is a child
+# process we fully terminate on stop(), so PipeWire tears the capture stream
+# down deterministically before the TTS reply plays.
 class PttRecorder:
     def __init__(self):
         self._proc = None
@@ -392,17 +380,17 @@ class PttRecorder:
             fd, self._wav_path = tempfile.mkstemp(suffix=".wav", prefix="ptt_")
             os.close(fd)
             self._proc = subprocess.Popen(
-                ["arecord", "-D", MIC_DEVICE, "-f", "S16_LE",
-                 "-r", str(RECORD_RATE), "-c", "1", self._wav_path],
+                ["pw-record", "--rate", str(RECORD_RATE), "--channels", "1",
+                 self._wav_path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-            log.info("arecord capture started → %s", self._wav_path)
+            log.info("pw-record capture started → %s", self._wav_path)
 
     def stop(self) -> Optional[str]:
         with self._lock:
             if self._proc is None:
                 return None
-            # SIGINT lets arecord flush the WAV header cleanly, then ensure exit.
+            # SIGINT lets pw-record flush the WAV header cleanly, then ensure exit.
             try:
                 self._proc.send_signal(signal.SIGINT)
                 try:
@@ -411,7 +399,7 @@ class PttRecorder:
                     self._proc.terminate()
                     self._proc.wait(timeout=2)
             except Exception as e:
-                log.warning("arecord stop error: %s", e)
+                log.warning("pw-record stop error: %s", e)
                 try:
                     self._proc.kill()
                 except Exception:
@@ -419,9 +407,8 @@ class PttRecorder:
             self._proc = None
             wav_path = self._wav_path
             self._wav_path = None
-            log.info("arecord capture stopped: %s", wav_path)
-            # Capture device is now fully closed (child exited). Half-duplex
-            # I2S bus is free for playback.
+            log.info("pw-record capture stopped: %s", wav_path)
+            # Capture stream closed (child exited); the source is free again.
             return wav_path
 
 recorder = PttRecorder()
@@ -429,8 +416,10 @@ recorder = PttRecorder()
 # ── STT via Hermes voice config ───────────────────────────────────────────────
 def transcribe(wav_path: str) -> Optional[str]:
     try:
-        from tools.transcription_tools import _transcribe_groq, DEFAULT_GROQ_STT_MODEL
-        result = _transcribe_groq(wav_path, DEFAULT_GROQ_STT_MODEL)
+        from tools.transcription_tools import transcribe_audio
+        # Provider/model come from ~/.hermes/config.yaml (stt: section) — the
+        # same STT settings as the rest of Hermes. No key passed by the bridge.
+        result = transcribe_audio(wav_path)
         if not result.get("success"):
             log.warning("STT failed: %s", result.get("error", "unknown error"))
             return None
@@ -438,7 +427,7 @@ def transcribe(wav_path: str) -> Optional[str]:
         if not text:
             log.warning("STT returned empty transcript")
             return None
-        log.info("STT (Groq): %r", text)
+        log.info("STT: %r", text)
         return text
     except Exception as e:
         log.error("STT error: %s", e)
@@ -489,6 +478,16 @@ def close_session(session_id: str):
         log.warning("Failed to close session %s: %s", session_id, e)
 
 
+def send_stats(transport: SerialTransport):
+    """Push the current session counters to the TTGO display."""
+    transport.send({
+        "type":        "chat_stats",
+        "messages":    state.messages,
+        "tokens":      state.tokens,
+        "context_pct": state.context_pct(),
+    })
+
+
 def handle_new_chat(transport: SerialTransport):
     global chat_starting
     with chat_start_lock:
@@ -498,12 +497,7 @@ def handle_new_chat(transport: SerialTransport):
             sid = state.sid
             if sid:
                 transport.send({"type": "chat_started", "session_id": sid})
-                transport.send({
-                    "type":        "chat_stats",
-                    "messages":    state.messages,
-                    "tokens":      state.tokens,
-                    "context_pct": state.context_pct(),
-                })
+                send_stats(transport)
                 transport.send({"type": "ack", "text": "Already started"})
             else:
                 transport.send({"type": "ack", "text": "Starting..."})
@@ -530,17 +524,8 @@ def handle_new_chat(transport: SerialTransport):
         )
 
         if result["ok"]:
-            with state._lock:
-                state.session_id = result["session_id"]
-                state.messages   = 1
-                state.tokens     = result["prompt_tokens"]
-
-            transport.send({
-                "type":        "chat_stats",
-                "messages":    state.messages,
-                "tokens":      state.tokens,
-                "context_pct": state.context_pct(),
-            })
+            state.apply_result(result, messages=1)
+            send_stats(transport)
             transport.send({"type": "ack", "text": "Ready!"})
             log.info("Session ready — %d prompt tokens", state.tokens)
             mark_chat_block(4.0)
@@ -561,11 +546,6 @@ def handle_ptt_stop(transport: SerialTransport):
     if not wav_path:
         transport.send({"type": "ack", "text": "No audio"})
         return
-
-    # Let ALSA half-duplex device settle after capture closes.
-    # Without this, the WM8960 codec may still be in capture mode when
-    # playback starts, routing audio to nowhere even though aplay rc=0.
-    time.sleep(0.5)
 
     transport.send({"type": "ack", "text": "Transcribing..."})
 
@@ -592,17 +572,8 @@ def handle_ptt_stop(transport: SerialTransport):
     result = hermes_chat(text, sid)
 
     if result["ok"]:
-        with state._lock:
-            state.session_id = result["session_id"]
-            state.messages  += 1
-            state.tokens     = result["prompt_tokens"]
-
-        transport.send({
-            "type":        "chat_stats",
-            "messages":    state.messages,
-            "tokens":      state.tokens,
-            "context_pct": state.context_pct(),
-        })
+        state.apply_result(result, increment=True)
+        send_stats(transport)
         transport.send({"type": "ack", "text": "Done"})
 
         # Speak response
@@ -617,7 +588,7 @@ def handle_ptt_stop(transport: SerialTransport):
 def run(transport: SerialTransport):
     log.info("Bridge running. Serial: %s @ %d", SERIAL_PORT, SERIAL_BAUD)
     log.info("Hermes API: %s  model: %s", API_BASE, API_MODEL)
-    log.info("Mic: %s  Speaker (WM8960): %s", MIC_DEVICE, AUDIO_DEVICE)
+    log.info("Audio: PipeWire default source (mic) + default sink (playback)")
 
     while True:
         line = transport.readline()
