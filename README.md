@@ -16,7 +16,7 @@ A tiny hardware **voice chat controller** for [Hermes Agent](https://github.com/
                                └──────────────┴───────────┴──────────────────┘
 ```
 
-**Hardware:** [LilyGO TTGO T-Display](https://www.lilygo.cc/products/lilygo%C2%AE-ttgo-t-display-1-14-inch-lcd-esp32-control-board) (ESP32, 135×240 ST7789 TFT, two buttons), a USB mic, and any ALSA or Bluetooth A2DP speaker.
+**Hardware:** [LilyGO TTGO T-Display](https://www.lilygo.cc/products/lilygo%C2%AE-ttgo-t-display-1-14-inch-lcd-esp32-control-board) (ESP32, 135×240 ST7789 TFT, two buttons), a USB or HAT mic, and an ALSA speaker/sound card.
 
 **Software:** Runs on a Linux host (Raspberry Pi, laptop, mini-PC) with [Hermes Agent](https://github.com/hypernym-ai/hermes-agent)'s API server enabled.
 
@@ -81,8 +81,8 @@ Required:
 
 Audio (adjust to your hardware — `arecord -l` / `aplay -l`):
 
-- `TTGO_MIC_DEVICE` (e.g. `hw:1,0`, `default`)
-- `TTGO_BT_DEVICE` (e.g. `default`, `plughw:0,0`, `bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp`)
+- `TTGO_MIC_DEVICE` (e.g. `plughw:wm8960soundcard,0`, `hw:1,0`, `default`)
+- `TTGO_AUDIO_DEVICE` (e.g. `plughw:wm8960soundcard,0`, `plughw:0,0`, `default`)
 
 ### 5. Flash the firmware
 
@@ -141,7 +141,7 @@ Hold RIGHT, say "hello", release. You should hear Hermes respond over your speak
 - **GPIO 0** is the **Upper** button.
 - **GPIO 35** is the **Lower** button.
 
-Works with any USB microphone. Tested extensively with a Logitech C920 (as `hw:3,0`) and a generic ATOP6868 Bluetooth A2DP speaker via `bluealsa`. A 3.5 mm jack + `default` also works fine.
+Works with any USB microphone or HAT mic. Tested on a WM8960 Audio HAT (`plughw:wm8960soundcard,0`) for both capture and playback. A 3.5 mm jack + `default` also works fine.
 
 ---
 
@@ -165,6 +165,8 @@ Works with any USB microphone. Tested extensively with a Logitech C920 (as `hw:3
 {"type": "error",        "text": "No session"}     // returns to idle
 ```
 
+**Session lifecycle:** When `new_chat` fires, the bridge closes the current session on the Hermes server (`DELETE /api/sessions/{id}`) in a background thread before starting the new one. This frees server-side memory and produces a clean break in the session DB.
+
 ---
 
 ## Configuration Reference
@@ -180,7 +182,7 @@ All settings live in `bridge/.env` (or `~/.hermes/.env`). See [`bridge/.env.exam
 | `TTGO_CHAT_PORT`       | `/dev/ttyACM0`                        | USB serial port                              |
 | `TTGO_CHAT_BAUD`       | `115200`                              | Baud rate (must match firmware)              |
 | `TTGO_MIC_DEVICE`      | `default`                             | ALSA capture device                          |
-| `TTGO_BT_DEVICE`       | `default`                             | ALSA playback device (or bluealsa:…)         |
+| `TTGO_AUDIO_DEVICE`    | `default`                             | ALSA playback device                         |
 | `TTGO_TTS_VOICE`       | `en-US-AvaMultilingualNeural`         | edge-tts voice                               |
 | `CTX_WINDOW_TOKENS`    | `200000`                              | Used for the % bar on the display            |
 | `HERMES_AGENT_ROOT`    | _(auto)_                              | Override path to the Hermes repo             |
@@ -222,34 +224,27 @@ bridge/.venv/bin/pip install 'openai>=1.40.0'
 **Bridge starts then exits immediately**
 Usually means the Hermes repo can't be imported. Set `HERMES_AGENT_ROOT=/abs/path/to/hermes-agent` in `bridge/.env`.
 
-**BT speaker silent** (check in this order)
+**Speaker silent** (check in this order)
 
 1. **Bridge routing** — the most common cause. Check the bridge log:
 
    ```bash
-   journalctl -u ttgo-chat-bridge -n 20 | grep "BT speaker"
+   journalctl -u ttgo-chat-bridge -n 20 | grep "Speaker"
    ```
 
-   If it says `BT speaker: default`, the bridge is playing to onboard ALSA — not to the BT sink. Set `TTGO_BT_DEVICE` in `bridge/.env` and restart:
+   It should report the ALSA device the bridge plays to. If it's wrong, set `TTGO_AUDIO_DEVICE` in `bridge/.env` and restart:
 
    ```bash
-   echo 'TTGO_BT_DEVICE=bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp' >> bridge/.env
+   echo 'TTGO_AUDIO_DEVICE=plughw:wm8960soundcard,0' >> bridge/.env
    sudo systemctl restart ttgo-chat-bridge
    ```
 
-2. **BT volume** — bluealsa sink volume tracks the remote device and can end up very low (e.g. 6/127). Check and bump:
+2. **System volume** — loudness is governed by the sound card's mixer, never baked into the audio. Check/raise it with `amixer` (e.g. for a WM8960 HAT: `amixer -c wm8960soundcard sset Speaker 100`).
+
+3. **Device reachable** — `aplay` cannot play MP3 directly; the bridge already converts to 44100 Hz stereo WAV via `ffmpeg`. Verify the device:
 
    ```bash
-   bluealsa-cli volume /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dpsrc/sink       # read
-   bluealsa-cli volume /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dpsrc/sink 90    # set
-   ```
-
-   Note: volume alone is never the fix if routing is wrong — the PCM never opens, so the change is inaudible regardless.
-
-3. **Device reachable** — `bluealsa` cannot play MP3 directly; the bridge already converts to 44100 Hz stereo WAV via `ffmpeg`. Verify the sink:
-
-   ```bash
-   aplay -D bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp --dump-hw-params /dev/null
+   aplay -D plughw:wm8960soundcard,0 --dump-hw-params /dev/null
    ```
 
 **RIGHT button feels flaky / PTT starts on reset**

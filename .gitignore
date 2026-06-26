@@ -31,3 +31,4 @@ bridge/ttgo-chat-bridge.service
 Thumbs.db
 *.swp
 *~
+*.bak
