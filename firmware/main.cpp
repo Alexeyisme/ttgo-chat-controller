@@ -113,67 +113,183 @@ void sendEvent(const char* name) {
     Serial.println();
 }
 
-// ── Drawing helpers ───────────────────────────────────────────────────────────
+// ── Layout constants (portrait 135×240) ────────────────────────────────────────
+#define HEADER_H     22         // Top header strip height
+#define HINT_H       30         // Bottom button-hint bar height
+#define MARGIN       8          // Side margin for cards
+
 void drawHeader(const char* title) {
-    // Elegant floating header (no block bg)
+    // Floating header title, baseline-aligned near the top edge
     tft.setTextColor(COL_HEADER_TXT, COL_BG);
     tft.setTextSize(1);
     tft.setTextDatum(ML_DATUM);
-    tft.drawString(title, 10, 14);
+    tft.drawString(title, MARGIN, HEADER_H / 2);
 }
 
 void drawBar(int x, int y, int w, int h, int pct, uint16_t col) {
-    // Modern segmented bar with rounded corners for the background
-    tft.fillRoundRect(x, y, w, h, 2, COL_BAR_BG);
+    tft.fillRoundRect(x, y, w, h, h / 2, COL_BAR_BG);
     int fill = (w * pct) / 100;
-    if (fill > 0) tft.fillRoundRect(x, y, fill, h, 2, col);
-    
-    // Tiny label above or below could be added if needed, but let's keep it clean
+    if (fill > 0) tft.fillRoundRect(x, y, fill < h ? h : fill, h, h / 2, col);
 }
 
 void drawConnDot(bool connected) {
     uint16_t col = connected ? COL_GREEN : COL_RED;
-    tft.fillCircle(tft.width() - 12, 14, 4, col);
+    tft.fillCircle(tft.width() - 12, HEADER_H / 2, 4, col);
+}
+
+// Rounded card panel with a subtle border. Returns nothing; caller fills content.
+void drawCard(int x, int y, int w, int h) {
+    tft.fillRoundRect(x, y, w, h, 6, COL_CARD_BG);
+    tft.drawRoundRect(x, y, w, h, 6, COL_CARD_BORDER);
+}
+
+// Bottom hint bar: two zones aligned to the physical buttons below the screen.
+// Left zone sits above GPIO35 (Talk), right zone above GPIO0 (New Chat).
+void drawHintBar() {
+    int w = tft.width();
+    int h = tft.height();
+    int y = h - HINT_H;
+    int half = w / 2;
+
+    tft.fillRect(0, y, w, HINT_H, COL_HINT_BG);
+    tft.drawFastHLine(0, y, w, COL_CARD_BORDER);
+    tft.drawFastVLine(half, y + 4, HINT_H - 8, COL_CARD_BORDER);
+
+    tft.setTextSize(1);
+    tft.setTextDatum(MC_DATUM);
+
+    // Left = TAP / NEW (GPIO0)
+    tft.setTextColor(COL_HINT_NEW, COL_HINT_BG);
+    tft.drawString("TAP", half / 2, y + 10);
+    tft.setTextColor(COL_LABEL, COL_HINT_BG);
+    tft.drawString("New chat", half / 2, y + 21);
+
+    // Right = HOLD / TALK (GPIO35)
+    tft.setTextColor(COL_HINT_TALK, COL_HINT_BG);
+    tft.drawString("HOLD", half + half / 2, y + 10);
+    tft.setTextColor(COL_LABEL, COL_HINT_BG);
+    tft.drawString("Talk", half + half / 2, y + 21);
 }
 
 // ── Screen renderers ──────────────────────────────────────────────────────────
+// Orbiting-mind glyph geometry
+#define ORBIT_R1     18         // inner orbit radius
+#define ORBIT_R2     30         // outer orbit radius
+#define ORBIT_CORE   7          // core orb radius
+#define ORBIT_CLEAR  (ORBIT_R2 + 6)   // bounding box half-size to clear each frame
+
+float idleOrbitAngle = 0.0f;    // inner-ring satellites angle
+float idleRedAngle   = 0.0f;    // outer-ring red sphere angle (own full-360 loop)
+
 void renderIdle() {
-    if (screen == prevScr) return; // Prevent flickering
+    int w = tft.width();
+    int h = tft.height();
+    int cx = w / 2;
+    int cy = (HEADER_H + (h - HINT_H)) / 2 - 14;
 
-    tft.fillScreen(COL_BG);
-    drawHeader("HERMES CORE");
-    drawConnDot(true);
+    // ── Static layer: draw once on entry ────────────────────────────────────
+    if (screen != prevScr) {
+        tft.fillScreen(COL_BG);
+        drawHeader("TULPA");
+        drawConnDot(true);
 
-    tft.setTextColor(COL_ACCENT, COL_BG);
-    tft.setTextSize(2);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("READY", tft.width() / 2, 60);
+        // Two faint orbit rings (the "mind's" aura)
+        tft.drawCircle(cx, cy, ORBIT_R1, COL_CARD_BORDER);
+        tft.drawCircle(cx, cy, ORBIT_R2, COL_CARD_BORDER);
 
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setTextSize(1);
-    tft.drawString("Tap TOP for New Chat", tft.width() / 2, 95);
-    tft.drawString("Hold BTM to Talk", tft.width() / 2, 110);
+        tft.setTextColor(COL_ACCENT, COL_BG);
+        tft.setTextSize(2);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString("Tulpa", cx, cy + 52);
+
+        tft.setTextColor(COL_LABEL, COL_BG);
+        tft.setTextSize(1);
+        tft.drawString("hermes-agent inside", cx, cy + 74);
+
+        drawHintBar();
+    }
+
+    // ── Animated layer: orbiting satellites + pulsing core, every tick ───────
+    if (millis() - lastAnimMs > ANIMATION_TICK_MS) {
+        lastAnimMs = millis();
+        idleOrbitAngle += 0.18f;
+        if (idleOrbitAngle >= 6.2832f) idleOrbitAngle -= 6.2832f;
+        // Red sphere advances steadily and wraps — completes a full 360° loop
+        idleRedAngle += 0.11f;
+        if (idleRedAngle >= 6.2832f) idleRedAngle -= 6.2832f;
+
+        // Clear the glyph region, then repaint the static rings under the dots
+        tft.fillRect(cx - ORBIT_CLEAR, cy - ORBIT_CLEAR,
+                     2 * ORBIT_CLEAR, 2 * ORBIT_CLEAR, COL_BG);
+        tft.drawCircle(cx, cy, ORBIT_R1, COL_CARD_BORDER);
+        tft.drawCircle(cx, cy, ORBIT_R2, COL_CARD_BORDER);
+
+        // Two satellites on the inner ring (opposite each other)
+        for (int i = 0; i < 2; i++) {
+            float a = idleOrbitAngle + i * 3.1416f;
+            int sx = cx + (int)(ORBIT_R1 * cosf(a));
+            int sy = cy + (int)(ORBIT_R1 * sinf(a));
+            tft.fillCircle(sx, sy, 2, COL_ACCENT);
+        }
+        // Red sphere on the outer ring — travels the full 360°
+        {
+            int sx = cx + (int)(ORBIT_R2 * cosf(idleRedAngle));
+            int sy = cy + (int)(ORBIT_R2 * sinf(idleRedAngle));
+            tft.fillCircle(sx, sy, 3, COL_RED);
+        }
+
+        // Gently pulsing core
+        int pulse = (idleOrbitAngle < 3.1416f) ? 0 : 1;
+        tft.fillCircle(cx, cy, ORBIT_CORE + pulse, COL_ACCENT);
+        tft.fillCircle(cx, cy, (ORBIT_CORE + pulse) - 3, COL_CYAN);
+    }
 }
 
 void renderStarting() {
     static int lastDots = -1;
+    int w = tft.width();
+    int h = tft.height();
+    int cy = (HEADER_H + (h - HINT_H)) / 2;
+
     if (screen != prevScr) {
         tft.fillScreen(COL_BG);
-        drawHeader("INITIALIZING");
+        drawHeader("NEW SESSION");
         drawConnDot(true);
+        drawHintBar();
         lastDots = -1; // Force dots redraw
     }
     if (startingDots != lastDots || screen != prevScr) {
         lastDots = startingDots;
-        tft.fillRect(0, 50, tft.width(), 60, COL_BG);
+
+        // Spinner-ish dot row beneath the word
+        tft.fillRect(0, cy - 24, w, 48, COL_BG);
         tft.setTextColor(COL_STARTING, COL_BG);
         tft.setTextSize(2);
         tft.setTextDatum(MC_DATUM);
-        
-        char dotLine[16] = "Hermes";
-        for (int i = 0; i < (startingDots % 4); i++) strcat(dotLine, ".");
-        tft.drawString(dotLine, tft.width() / 2, 75);
+        tft.drawString("Tulpa", w / 2, cy - 8);
+
+        int active = startingDots % 4;       // 0..3
+        int dotR = 3, gap = 14;
+        int n = 3;
+        int startX = w / 2 - ((n - 1) * gap) / 2;
+        for (int i = 0; i < n; i++) {
+            uint16_t c = (i < ((active == 0) ? 0 : active)) ? COL_STARTING : COL_CARD_BORDER;
+            tft.fillCircle(startX + i * gap, cy + 18, dotR, c);
+        }
     }
+}
+
+// One stat card: label (small, muted) on top, value (large, white) below.
+static void drawStatCard(int x, int y, int w, int h, const char* label, const char* value) {
+    drawCard(x, y, w, h);
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(COL_LABEL, COL_CARD_BG);
+    tft.setTextSize(1);
+    tft.drawString(label, x + 10, y + 13);
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextColor(COL_VALUE, COL_CARD_BG);
+    tft.setTextSize(2);
+    tft.drawString(value, x + w - 10, y + h / 2 + 2);
 }
 
 void renderStats() {
@@ -187,71 +303,73 @@ void renderStats() {
     bool force = (screen != prevScr);
     bool ackActive = (millis() < ackUntilMs && ackText[0]);
 
+    // Card geometry
+    int cardX = MARGIN;
+    int cardW = w - 2 * MARGIN;
+    int cardH = 38;
+    int gap   = 8;
+    int y0    = HEADER_H + 6;          // msgs card top
+    int y1    = y0 + cardH + gap;      // tokens card top
+    int y2    = y1 + cardH + gap;      // context card top
+    int ctxH  = 50;                    // context card is taller (holds bar)
+    int ackY  = y2 + ctxH + gap;       // ack/status line
+
     if (force) {
         tft.fillScreen(COL_BG);
-        drawHeader("SESSION STATS");
+        drawHeader("SESSION");
         drawConnDot(true);
-        tft.drawFastVLine(w / 2, 35, 60, COL_BAR_BG);
-        lastMsgs = -1; lastTokens = -1; lastPct = -1;
+        drawHintBar();
+        // Draw static card frames once
+        drawCard(cardX, y2, cardW, ctxH);
+        lastMsgs = -1; lastTokens = -1; lastPct = -1; lastAck = false;
     }
 
     if (force || statsMessages != lastMsgs) {
         lastMsgs = statsMessages;
-        tft.setTextColor(COL_LABEL, COL_BG);
-        tft.setTextSize(1);
-        tft.setTextDatum(MC_DATUM);
-        tft.drawString("MESSAGES", w / 4, 45);
-        tft.setTextColor(COL_VALUE, COL_BG);
-        tft.setTextSize(2);
-        char msgBuf[12];
-        snprintf(msgBuf, sizeof(msgBuf), "%d", statsMessages);
-        tft.fillRect(10, 55, (w / 2) - 20, 25, COL_BG);
-        tft.drawString(msgBuf, w / 4, 70);
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%d", statsMessages);
+        drawStatCard(cardX, y0, cardW, cardH, "MESSAGES", buf);
     }
 
     if (force || statsTokens != lastTokens) {
         lastTokens = statsTokens;
-        tft.setTextColor(COL_LABEL, COL_BG);
-        tft.setTextSize(1);
-        tft.setTextDatum(MC_DATUM);
-        tft.drawString("TOKENS", (w * 3) / 4, 45);
-        char tokBuf[24];
+        char buf[24];
         if (statsTokens >= 1000)
-            snprintf(tokBuf, sizeof(tokBuf), "%d.%dk", statsTokens / 1000, (statsTokens % 1000) / 100);
+            snprintf(buf, sizeof(buf), "%d.%dk", statsTokens / 1000, (statsTokens % 1000) / 100);
         else
-            snprintf(tokBuf, sizeof(tokBuf), "%d", statsTokens);
-        tft.setTextColor(COL_VALUE, COL_BG);
-        tft.setTextSize(2);
-        tft.fillRect((w / 2) + 10, 55, (w / 2) - 20, 25, COL_BG);
-        tft.drawString(tokBuf, (w * 3) / 4, 70);
+            snprintf(buf, sizeof(buf), "%d", statsTokens);
+        drawStatCard(cardX, y1, cardW, cardH, "TOKENS", buf);
     }
 
     int pct = statsPct < 0 ? 0 : (statsPct > 100 ? 100 : statsPct);
     if (force || pct != lastPct) {
         lastPct = pct;
-        tft.setTextColor(COL_LABEL, COL_BG);
-        tft.setTextSize(1);
+        // Label + percent inside the context card
         tft.setTextDatum(ML_DATUM);
-        tft.drawString("Context", 15, 107);
+        tft.setTextColor(COL_LABEL, COL_CARD_BG);
+        tft.setTextSize(1);
+        tft.drawString("CONTEXT", cardX + 10, y2 + 13);
         char pctBuf[8];
         snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
+        // clear old percent area before redraw
+        tft.fillRect(cardX + cardW - 44, y2 + 6, 36, 14, COL_CARD_BG);
         tft.setTextDatum(MR_DATUM);
-        tft.drawString(pctBuf, w - 15, 107);
-        drawBar(15, 117, w - 30, 8, pct, COL_ORANGE);
+        tft.setTextColor(COL_VALUE, COL_CARD_BG);
+        tft.drawString(pctBuf, cardX + cardW - 10, y2 + 13);
+        uint16_t barCol = (pct >= 85) ? COL_RED : (pct >= 60 ? COL_ORANGE : COL_ACCENT);
+        drawBar(cardX + 10, y2 + ctxH - 16, cardW - 20, 8, pct, barCol);
     }
 
     if (ackActive || lastAck != ackActive) {
         lastAck = ackActive;
-        // Clear status region (y=86 to 98) — stays away from "Context" at 107
-        tft.fillRect(15, 86, w - 30, 14, COL_BG); 
-        
+        tft.fillRect(MARGIN, ackY, cardW, 12, COL_BG);
         if (ackActive) {
             tft.setTextColor(COL_ACCENT, COL_BG);
             tft.setTextSize(1);
             tft.setTextDatum(ML_DATUM);
             char statusBuf[40];
             snprintf(statusBuf, sizeof(statusBuf), "> %s", ackText);
-            tft.drawString(statusBuf, 15, 91);
+            tft.drawString(statusBuf, MARGIN + 2, ackY + 5);
         }
     }
 }
@@ -259,15 +377,16 @@ void renderStats() {
 void renderPtt() {
     int w = tft.width();
     int h = tft.height();
+    int contentBottom = h - HINT_H;
 
     if (screen != prevScr) {
         tft.fillScreen(COL_PTT_BG);
         drawHeader("LISTENING");
         drawConnDot(true);
-        
-        // Mic icon
+
+        // Mic icon near the top of the content area
         int cx = w / 2;
-        int cy = 45; // Moved up slightly for landscape
+        int cy = HEADER_H + 36;
         tft.fillRoundRect(cx - 8, cy - 15, 16, 25, 8, COL_PTT_WAVE);
         tft.drawCircle(cx, cy, 18, COL_PTT_WAVE);
         tft.drawFastVLine(cx, cy + 18, 5, COL_PTT_WAVE);
@@ -276,22 +395,22 @@ void renderPtt() {
         tft.setTextColor(COL_PTT_WAVE, COL_PTT_BG);
         tft.setTextSize(1);
         tft.setTextDatum(MC_DATUM);
-        tft.drawString("RELEASE TO SEND", w / 2, h - 15);
+        tft.drawString("Release to send", w / 2, contentBottom - 14);
     }
 
-    // Animated waveform bars
+    // Animated waveform bars, centered in the lower content area
     if (millis() - lastAnimMs > ANIMATION_TICK_MS) {
         lastAnimMs = millis();
         wavePhase  = (wavePhase + 1) % 8;
         const int heights[] = {8, 16, 28, 40, 28, 16, 8, 6};
-        int numBars = 9;
+        int numBars = 7;                       // fewer bars — narrow portrait
         int barW = 10, gap = 6;
         int totalW = numBars * barW + (numBars - 1) * gap;
         int startX = (w - totalW) / 2;
-        int baseY  = h - 50; 
-        
-        tft.fillRect(0, baseY - 22, w, 45, COL_PTT_BG);
-        
+        int baseY  = (HEADER_H + 72 + contentBottom - 30) / 2;
+
+        tft.fillRect(0, baseY - 24, w, 48, COL_PTT_BG);
+
         for (int i = 0; i < numBars; i++) {
             int currentH = heights[(wavePhase + i) % 8];
             int x = startX + i * (barW + gap);
@@ -406,15 +525,41 @@ void setup() {
     tft.setRotation(TFT_ROTATION);
     tft.fillScreen(COL_BG);
 
-    // Splash
-    tft.setTextColor(COL_CYAN, COL_BG);
-    tft.setTextSize(2);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("HERMES", SCREEN_W / 2, 100);
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.drawString("Chat Controller", SCREEN_W / 2, 124);
-    delay(800);
+    // ── Splash (portrait) ─────────────────────────────────────────────────────
+    {
+        int w  = tft.width();
+        int h  = tft.height();
+        int cx = w / 2;
+        int cy = h / 2 - 20;
+
+        // Winged-helmet nod: a hexagon emblem with a cyan core, drawn ring-by-ring
+        for (int r = 34; r >= 22; r -= 4) {
+            uint16_t c = (r <= 22) ? COL_ACCENT : COL_CARD_BORDER;
+            tft.drawCircle(cx, cy, r, c);
+        }
+        // Small "wing" ticks flanking the emblem
+        tft.drawFastHLine(cx - 50, cy, 12, COL_ACCENT);
+        tft.drawFastHLine(cx + 38, cy, 12, COL_ACCENT);
+        tft.fillTriangle(cx - 7, cy - 9, cx - 7, cy + 9, cx + 9, cy, COL_ACCENT);
+
+        // Wordmark
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(COL_CYAN, COL_BG);
+        tft.setTextSize(2);
+        tft.drawString("Tulpa", cx, cy + 56);
+        tft.setTextSize(1);
+        tft.setTextColor(COL_LABEL, COL_BG);
+        tft.drawString("Chat Controller", cx, cy + 78);
+
+        // Brief loading underline that fills left-to-right
+        int barW = w - 40, barX = 20, barY = cy + 96;
+        tft.drawRoundRect(barX, barY, barW, 6, 3, COL_CARD_BORDER);
+        for (int f = 0; f <= barW - 2; f += 6) {
+            tft.fillRoundRect(barX + 1, barY + 1, f, 4, 2, COL_ACCENT);
+            delay(18);
+        }
+    }
+    delay(250);
 
     pinMode(BTN1_PIN, INPUT);           // GPIO35 — input only, no pull-up
     pinMode(BTN2_PIN, INPUT_PULLUP);    // GPIO0  — has internal pull-up

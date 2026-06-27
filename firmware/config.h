@@ -6,9 +6,11 @@
 #define SP_BUF_SIZE         512     // Input line buffer (small — no images here)
 
 // ── TFT ────────────────────────────────────────────────────────────────────────
-#define TFT_ROTATION    3           // Trying 3 (flipped landscape)
-#define SCREEN_W        240
-#define SCREEN_H        135
+// Portrait orientation: device held vertically, USB + buttons at the bottom.
+// GPIO35 = lower-LEFT button (Talk), GPIO0 = lower-RIGHT button (New Chat).
+#define TFT_ROTATION    0           // Portrait, USB at bottom
+#define SCREEN_W        135
+#define SCREEN_H        240
 #define TFT_BL          4           // Backlight GPIO
 
 // ── Buttons ────────────────────────────────────────────────────────────────────
@@ -38,6 +40,11 @@
 #define COL_PTT_BG      0x0000
 #define COL_PTT_WAVE    0x07FF      // Cyan pulses
 #define COL_STARTING    0x07FF      // Cyan "STARTING" text
+#define COL_CARD_BG     0x10A2      // Card panel fill (very dark blue-gray)
+#define COL_CARD_BORDER 0x2945      // Card border (subtle slate)
+#define COL_HINT_BG     0x10A2      // Bottom hint bar fill
+#define COL_HINT_TALK   0x07FF      // Talk hint accent (cyan)
+#define COL_HINT_NEW    0xFD20      // New-chat hint accent (orange)
 
 // ── Timing ─────────────────────────────────────────────────────────────────────
 #define ANIMATION_TICK_MS   80      // Slightly faster animations
