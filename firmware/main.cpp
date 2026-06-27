@@ -187,17 +187,18 @@ void drawHintBar() {
     tft.setTextSize(1);
     tft.setTextDatum(MC_DATUM);
 
+    // Two rows centered in the bar (y0=210, h=30, center=225): +10 / +20.
     // Left = TAP / NEW (GPIO0)
     tft.setTextColor(COL_HINT_NEW, COL_HINT_BG);
     tft.drawString("TAP", half / 2, y + 10);
     tft.setTextColor(COL_LABEL, COL_HINT_BG);
-    tft.drawString("New chat", half / 2, y + 21);
+    tft.drawString("New chat", half / 2, y + 20);
 
     // Right = HOLD / TALK (GPIO35)
     tft.setTextColor(COL_HINT_TALK, COL_HINT_BG);
     tft.drawString("HOLD", half + half / 2, y + 10);
     tft.setTextColor(COL_LABEL, COL_HINT_BG);
-    tft.drawString("Talk", half + half / 2, y + 21);
+    tft.drawString("Talk", half + half / 2, y + 20);
 }
 
 // ── Screen renderers ──────────────────────────────────────────────────────────
@@ -210,7 +211,7 @@ void drawHintBar() {
 #define IDLE_ANIM_Y  68         // animation card top
 #define IDLE_ANIM_H  80         // animation card height
 #define IDLE_SESS_Y  152        // session card top
-#define IDLE_SESS_H  52         // session card height (152+52 = 204, hints at 210)
+#define IDLE_SESS_H  56         // session card height (152+56 = 208, 2px to hints)
 #define GLYPH_CY     (IDLE_ANIM_Y + IDLE_ANIM_H / 2)   // = 108
 // Fireflies fill the whole animation card interior (inside the border + pad).
 #define ANIM_PAD     4          // inset from card edges for the clear box
@@ -518,7 +519,7 @@ static void drawDuoStatCard(int x, int y, int w, int h,
 #define CHAT_CTX_Y   104        // context one-liner
 #define CHAT_CTX_H   24
 #define CHAT_STAT_Y  132        // STATUS card (dynamic, animated)
-#define CHAT_STAT_H  72         // 132+72 = 204, hints at 210
+#define CHAT_STAT_H  76         // 132+76 = 208, 2px to hints
 
 // STATUS card: label + current phase/tool text, plus an animated spinner dot
 // while busy. The spinner area is redrawn each anim tick (see renderStats).
