@@ -75,6 +75,7 @@ log = logging.getLogger("ttgo-chat")
 class ChatState:
     def __init__(self):
         self.session_id: Optional[str] = None
+        self.name:       Optional[str] = None   # friendly name, from 1st utterance
         self.messages:   int = 0
         self.tokens:     int = 0
         self._lock = threading.Lock()
@@ -82,9 +83,26 @@ class ChatState:
     def new_session(self) -> str:
         with self._lock:
             self.session_id = str(uuid.uuid4())
+            self.name     = None
             self.messages = 0
             self.tokens   = 0
         return self.session_id
+
+    def name_from_utterance(self, text: str) -> Optional[str]:
+        """Set the session name from the first utterance, once. Returns the new
+        name if it was just set, else None (already named / empty text)."""
+        cleaned = " ".join((text or "").split()).strip().lower()
+        if not cleaned:
+            return None
+        # Trim to ~24 chars on a word boundary so it fits the TTGO card.
+        if len(cleaned) > 24:
+            cut = cleaned[:24].rsplit(" ", 1)[0]
+            cleaned = (cut or cleaned[:24]).rstrip()
+        with self._lock:
+            if self.name:
+                return None
+            self.name = cleaned
+        return cleaned
 
     def update(self, messages: int, tokens: int):
         with self._lock:
@@ -434,8 +452,16 @@ def transcribe(wav_path: str) -> Optional[str]:
         return None
 
 # ── Hermes API ────────────────────────────────────────────────────────────────
-def hermes_chat(text: str, session_id: str) -> dict:
-    """Send a message; return dict with ok, content, session_id, prompt_tokens."""
+def hermes_chat(text: str, session_id: str,
+                transport: Optional["SerialTransport"] = None) -> dict:
+    """Send a message; return dict with ok, content, session_id, prompt_tokens.
+
+    Streams the response so we can forward live tool-call progress to the TTGO
+    STATUS card via `transport` (if given). Hermes emits, interleaved with the
+    OpenAI-style content chunks:
+        event: hermes.tool.progress
+        data: {"tool": "...", "status": "running|completed", ...}
+    """
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {API_KEY}",
@@ -444,20 +470,65 @@ def hermes_chat(text: str, session_id: str) -> dict:
     payload = {
         "model": API_MODEL,
         "messages": [{"role": "user", "content": text}],
-        "stream": False,
+        "stream": True,
     }
+    content_parts: list[str] = []
+    usage: dict = {}
+    resolved_sid = session_id
+    pending_event: Optional[str] = None
+    n_tools = 0
     try:
-        r = requests.post(
+        with requests.post(
             f"{API_BASE}/v1/chat/completions",
-            headers=headers, json=payload, timeout=120,
-        )
-        r.raise_for_status()
-        data = r.json()
-        usage = data.get("usage", {})
+            headers=headers, json=payload, timeout=120, stream=True,
+        ) as r:
+            r.raise_for_status()
+            resolved_sid = r.headers.get("X-Hermes-Session-Id", session_id)
+            for raw in r.iter_lines(decode_unicode=True):
+                if raw is None or raw == "":
+                    continue
+                if raw.startswith("event:"):
+                    pending_event = raw[6:].strip()
+                    continue
+                if not raw.startswith("data:"):
+                    continue
+                data_str = raw[5:].strip()
+                if data_str == "[DONE]":
+                    break
+
+                # Tool progress event → drive the STATUS card.
+                if pending_event == "hermes.tool.progress":
+                    pending_event = None
+                    try:
+                        ev = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    if transport is not None and ev.get("status") == "running":
+                        n_tools += 1
+                        send_status(transport, _tool_label(ev.get("tool", "tool")))
+                        log.info("Tool running: %s", ev.get("tool"))
+                    continue
+
+                # Normal OpenAI-style content chunk.
+                pending_event = None
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if "usage" in chunk and chunk["usage"]:
+                    usage = chunk["usage"]
+                for choice in chunk.get("choices", []):
+                    piece = (choice.get("delta") or {}).get("content")
+                    if piece:
+                        content_parts.append(piece)
+                        # First content after tool calls → answer is forming.
+                        if transport is not None and n_tools and len(content_parts) == 1:
+                            send_status(transport, "Writing reply")
+
         return {
-            "ok":           True,
-            "content":      data["choices"][0]["message"]["content"],
-            "session_id":   r.headers.get("X-Hermes-Session-Id", session_id),
+            "ok":            True,
+            "content":       "".join(content_parts).strip(),
+            "session_id":    resolved_sid,
             "prompt_tokens": usage.get("prompt_tokens", 0),
             "total_tokens":  usage.get("total_tokens",  0),
         }
@@ -486,6 +557,31 @@ def send_stats(transport: SerialTransport):
         "tokens":      state.tokens,
         "context_pct": state.context_pct(),
     })
+
+
+def send_status(transport: SerialTransport, text: str, busy: bool = True):
+    """Push a STATUS-card phase to the TTGO. `busy` animates the spinner.
+    Text is kept short (the card holds ~12 chars at size 2, ~24 at size 1)."""
+    transport.send({"type": "status", "text": text[:24], "busy": busy})
+
+
+# Friendly, screen-sized labels for Hermes tool names (the card can't show emoji).
+_TOOL_LABELS = {
+    "execute_code":   "Running code",
+    "web_search":     "Searching web",
+    "web_fetch":      "Fetching page",
+    "read_file":      "Reading file",
+    "write_file":     "Writing file",
+    "shell":          "Running shell",
+    "homeassistant":  "Home Assistant",
+}
+
+
+def _tool_label(tool: str) -> str:
+    """Map a Hermes tool id to a short human label; fall back to the raw name."""
+    if tool in _TOOL_LABELS:
+        return _TOOL_LABELS[tool]
+    return tool.replace("_", " ").title()[:24]
 
 
 # ── Host telemetry (Pi CPU temp + battery) ──────────────────────────────────────
@@ -559,7 +655,8 @@ def handle_new_chat(transport: SerialTransport):
             # Re-sync display so firmware doesn't time out in SCR_STARTING
             sid = state.sid
             if sid:
-                transport.send({"type": "chat_started", "session_id": sid})
+                transport.send({"type": "chat_started", "session_id": sid,
+                                "name": state.name or ""})
                 send_stats(transport)
                 transport.send({"type": "ack", "text": "Already started"})
             else:
@@ -576,27 +673,26 @@ def handle_new_chat(transport: SerialTransport):
         sid = state.new_session()
         log.info("New chat — session=%s", sid)
 
-        # Confirm to display immediately (starts the animation on TTGO)
-        transport.send({"type": "chat_started", "session_id": sid})
-        transport.send({"type": "ack", "text": "Connecting..."})
+        # Confirm to display immediately (starts the animation on TTGO).
+        # Name is still empty here — it's learned from the first utterance.
+        transport.send({"type": "chat_started", "session_id": sid, "name": ""})
+        send_status(transport, "Connecting")
 
         result = hermes_chat(
             "Hello! I just started a new chat from my hardware chat controller. "
             "Please greet me very briefly (one sentence).",
-            sid,
+            sid, transport,
         )
 
         if result["ok"]:
             state.apply_result(result, messages=1)
             send_stats(transport)
-            transport.send({"type": "ack", "text": "Ready!"})
             log.info("Session ready — %d prompt tokens", state.tokens)
             mark_chat_block(4.0)
 
-            # Speak the greeting
-            threading.Thread(
-                target=speak, args=(result["content"],), daemon=True
-            ).start()
+            # Speak the greeting with a Speaking → Ready status bracket.
+            threading.Thread(target=speak_with_status,
+                             args=(transport, result["content"]), daemon=True).start()
         else:
             transport.send({"type": "error", "text": "API error"})
     finally:
@@ -604,13 +700,23 @@ def handle_new_chat(transport: SerialTransport):
             chat_starting = False
 
 
+def speak_with_status(transport: SerialTransport, text: str):
+    """Show 'Speaking' on the STATUS card for the duration of TTS playback,
+    then 'Ready' (idle). Runs synchronously — call in a thread."""
+    send_status(transport, "Speaking", busy=True)
+    try:
+        speak(text)
+    finally:
+        send_status(transport, "Ready", busy=False)
+
+
 def handle_ptt_stop(transport: SerialTransport):
     wav_path = recorder.stop()
     if not wav_path:
-        transport.send({"type": "ack", "text": "No audio"})
+        send_status(transport, "No audio", busy=False)
         return
 
-    transport.send({"type": "ack", "text": "Transcribing..."})
+    send_status(transport, "Transcribing")
 
     text = transcribe(wav_path)
     try:
@@ -619,33 +725,40 @@ def handle_ptt_stop(transport: SerialTransport):
         pass
 
     if not text:
-        transport.send({"type": "ack", "text": "Didn't catch that"})
+        send_status(transport, "Didn't catch that", busy=False)
         log.warning("No transcript; check mic capture and STT provider")
-        speak("Sorry, I didn't catch that.")
+        threading.Thread(target=speak_with_status,
+                         args=(transport, "Sorry, I didn't catch that."),
+                         daemon=True).start()
         return
 
     sid = state.sid
     if not sid:
-        transport.send({"type": "ack", "text": "No session — press LEFT"})
+        send_status(transport, "No session", busy=False)
         return
 
-    transport.send({"type": "ack", "text": "Thinking..."})
+    # Name the session from the first thing the user actually says.
+    new_name = state.name_from_utterance(text)
+    if new_name:
+        transport.send({"type": "session_name", "name": new_name})
+
+    send_status(transport, "Thinking")
     log.info("Sending to Hermes: %r", text[:60])
 
-    result = hermes_chat(text, sid)
+    # Streaming call forwards live tool-call progress to the STATUS card.
+    result = hermes_chat(text, sid, transport)
 
     if result["ok"]:
         state.apply_result(result, increment=True)
         send_stats(transport)
-        transport.send({"type": "ack", "text": "Done"})
-
-        # Speak response
-        threading.Thread(
-            target=speak, args=(result["content"],), daemon=True
-        ).start()
+        # Speak the reply with a Speaking → Ready status bracket.
+        threading.Thread(target=speak_with_status,
+                         args=(transport, result["content"]), daemon=True).start()
     else:
-        transport.send({"type": "ack", "text": "API error"})
-        speak("Sorry, there was an error talking to Hermes.")
+        send_status(transport, "API error", busy=False)
+        threading.Thread(target=speak_with_status,
+                         args=(transport, "Sorry, there was an error talking to Hermes."),
+                         daemon=True).start()
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def run(transport: SerialTransport):

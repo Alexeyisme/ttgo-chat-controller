@@ -10,9 +10,17 @@
  *              {"event":"ptt_start"}
  *              {"event":"ptt_stop"}
  *              {"event":"device_ready"}
- *   Pi→TTGO:  {"type":"chat_started","session_id":"..."}
+ *   Pi→TTGO:  {"type":"chat_started","session_id":"...","name":"..."}
+ *              {"type":"session_name","name":"..."}  (learned from 1st utterance)
  *              {"type":"chat_stats","messages":N,"tokens":T,"context_pct":P}
+ *              {"type":"status","text":"...","busy":true}  (live STATUS card)
+ *              {"type":"telemetry","cpu_temp":C,"battery":P}  (host metrics)
  *              {"type":"ack","text":"..."}   (short status banner)
+ *              {"type":"error","text":"..."}
+ *
+ * Idle screen shows a SESSION card (name + N msg · Nk/M tok) when a chat is
+ * active; "No active session." otherwise. After IDLE_TIMEOUT_MS of no activity
+ * (any PTT / new_chat / stats) the stats screen falls back to idle.
  */
 
 #include <Arduino.h>
@@ -42,9 +50,19 @@ char statsSessionId[40] = "";
 bool statsStale       = false;
 unsigned long lastStatsMs = 0;
 
+// Session identity (shown on the idle SESSION card)
+bool sessionActive    = false;          // a chat exists on the host
+char sessionName[28]  = "";             // friendly name; empty until 1st utterance
+unsigned long lastActivityMs = 0;       // any PTT / new_chat / stats — drives auto-idle
+
 // Ack banner
 char   ackText[32]    = "";
 unsigned long ackUntilMs = 0;
+
+// Live STATUS card (chat screen): current phase/tool, persists until replaced.
+// `statusBusy` drives a small animated spinner dot while the agent is working.
+char   statusText[28] = "";
+bool   statusBusy     = false;
 
 // Host telemetry (Pi CPU temp + battery), -1 = unknown/not reported
 int  teleCpuTemp      = -1;     // °C
@@ -120,7 +138,7 @@ void sendEvent(const char* name) {
 // ── Layout constants (portrait 135×240) ────────────────────────────────────────
 #define HEADER_H     22         // Top header strip height
 #define HINT_H       30         // Bottom button-hint bar height
-#define MARGIN       8          // Side margin for cards
+#define MARGIN       3          // Side margin for cards (smaller = wider cards)
 
 void drawHeader(const char* title) {
     // Floating header title, baseline-aligned near the top edge
@@ -145,6 +163,13 @@ void drawConnDot(bool connected) {
 void drawCard(int x, int y, int w, int h) {
     tft.fillRoundRect(x, y, w, h, 6, COL_CARD_BG);
     tft.drawRoundRect(x, y, w, h, 6, COL_CARD_BORDER);
+}
+
+// Format a token count compactly: 2_400_000 → "2M", 5_400 → "5k", 850 → "850".
+static void fmtTokens(int tokens, char* out, size_t n) {
+    if (tokens >= 1000000)      snprintf(out, n, "%d.%dM", tokens / 1000000, (tokens % 1000000) / 100000);
+    else if (tokens >= 1000)    snprintf(out, n, "%d.%dk", tokens / 1000, (tokens % 1000) / 100);
+    else                        snprintf(out, n, "%d", tokens);
 }
 
 // Bottom hint bar: two zones aligned to the physical buttons below the screen.
@@ -176,15 +201,21 @@ void drawHintBar() {
 }
 
 // ── Screen renderers ──────────────────────────────────────────────────────────
-// Idle is a card dashboard: a telemetry card (battery + CPU temp) on top and an
-// animation card below. The animation is centered in its card at GLYPH_CY and
+// Idle is a card dashboard, top → bottom: a telemetry card (battery + CPU temp),
+// a smaller animation card, then a SESSION card (name + N msg · Nk/M tok, or
+// "No active session."). The animation is centered in its card at GLYPH_CY and
 // owns a clear box of half-size GLYPH_CLEAR.
-#define IDLE_TELE_Y  28         // telemetry card top
-#define IDLE_TELE_H  44         // telemetry card height
-#define IDLE_ANIM_Y  80         // animation card top
-#define IDLE_ANIM_H  124        // animation card height (down to just above hints)
-#define GLYPH_CY     (IDLE_ANIM_Y + IDLE_ANIM_H / 2)   // = 142
-#define GLYPH_CLEAR  50         // half-size of the square cleared each frame
+#define IDLE_TELE_Y  24         // telemetry card top (just under header)
+#define IDLE_TELE_H  40         // telemetry card height
+#define IDLE_ANIM_Y  68         // animation card top
+#define IDLE_ANIM_H  80         // animation card height
+#define IDLE_SESS_Y  152        // session card top
+#define IDLE_SESS_H  52         // session card height (152+52 = 204, hints at 210)
+#define GLYPH_CY     (IDLE_ANIM_Y + IDLE_ANIM_H / 2)   // = 108
+// Fireflies fill the whole animation card interior (inside the border + pad).
+#define ANIM_PAD     4          // inset from card edges for the clear box
+#define GLYPH_HW     ((SCREEN_W - 2 * MARGIN) / 2 - ANIM_PAD)   // clear half-width
+#define GLYPH_HH     (IDLE_ANIM_H / 2 - ANIM_PAD)               // clear half-height
 
 // ── Idle animation ──────────────────────────────────────────────────────────
 float idleT = 0.0f;     // generic phase, advances each tick
@@ -194,22 +225,24 @@ float fireX[8], fireY[8], fireVX[8], fireVY[8];
 bool  fireInit = false;
 
 static inline void clearGlyph(int cx, int cy) {
-    // Animation lives inside the animation card — clear to the card background.
-    tft.fillRect(cx - GLYPH_CLEAR, cy - GLYPH_CLEAR,
-                 2 * GLYPH_CLEAR, 2 * GLYPH_CLEAR, COL_CARD_BG);
+    // Clear the whole animation-card interior so fireflies can roam the card.
+    tft.fillRect(cx - GLYPH_HW, cy - GLYPH_HH,
+                 2 * GLYPH_HW, 2 * GLYPH_HH, COL_CARD_BG);
 }
 
-// Telemetry card: BATTERY (left half, value + bar) | CPU (right half).
-// A metric that hasn't been reported (value < 0) shows a muted "--".
-static void drawIdleTelemetry() {
+// Telemetry card: BATTERY (left half) | CPU (right half). A metric that hasn't
+// been reported (value < 0) shows a muted "--". Shared by the idle dashboard
+// and the chat screen (any y, height h). `showBar` draws the slim charge bar
+// under the battery value (idle only; chat screen is compact and omits it).
+static void drawTelemetryCard(int y, int h, bool showBar) {
     int w  = tft.width();
     int x  = MARGIN;
     int cw = w - 2 * MARGIN;
-    int y  = IDLE_TELE_Y;
     int half = x + cw / 2;
+    int valY = y + h / 2 + 4;       // value baseline, vertically centered-ish
 
-    drawCard(x, y, cw, IDLE_TELE_H);
-    tft.drawFastVLine(half, y + 8, IDLE_TELE_H - 16, COL_CARD_BORDER);
+    drawCard(x, y, cw, h);
+    tft.drawFastVLine(half, y + 8, h - 16, COL_CARD_BORDER);
     tft.setTextSize(1);
 
     // ── Battery (left half) ──────────────────────────────────────────────
@@ -223,14 +256,13 @@ static void drawIdleTelemetry() {
         snprintf(b, sizeof(b), "%d%%", teleBattery);
         tft.setTextColor(COL_VALUE, COL_CARD_BG);
         tft.setTextSize(2);
-        tft.drawString(b, x + 10, y + 30);
+        tft.drawString(b, x + 10, valY);
         tft.setTextSize(1);
-        // slim charge bar under the value
-        drawBar(x + 10, y + IDLE_TELE_H - 9, cw / 2 - 20, 4, teleBattery, col);
+        if (showBar) drawBar(x + 10, y + h - 9, cw / 2 - 20, 4, teleBattery, col);
     } else {
         tft.setTextColor(COL_CARD_BORDER, COL_CARD_BG);
         tft.setTextSize(2);
-        tft.drawString("--", x + 10, y + 30);
+        tft.drawString("--", x + 10, valY);
         tft.setTextSize(1);
     }
 
@@ -245,38 +277,117 @@ static void drawIdleTelemetry() {
         snprintf(t, sizeof(t), "%dC", teleCpuTemp);
         tft.setTextColor(col, COL_CARD_BG);
         tft.setTextSize(2);
-        tft.drawString(t, half + 10, y + 30);
+        tft.drawString(t, half + 10, valY);
         tft.setTextSize(1);
     } else {
         tft.setTextColor(COL_CARD_BORDER, COL_CARD_BG);
         tft.setTextSize(2);
-        tft.drawString("--", half + 10, y + 30);
+        tft.drawString("--", half + 10, valY);
         tft.setTextSize(1);
     }
 }
 
-// Firefly swarm drifting within a soft circle (the idle animation)
+static inline void drawIdleTelemetry() { drawTelemetryCard(IDLE_TELE_Y, IDLE_TELE_H, true); }
+
+// Firefly swarm drifting across the whole animation card. The swarm fills the
+// card's rectangular interior (GLYPH_HW × GLYPH_HH around the center), bouncing
+// off each wall independently so it covers corners too.
 static void animFireflies(int cx, int cy) {
+    // Keep the swarm a couple of px inside the clear box, which itself sits
+    // ANIM_PAD inside the card — so a firefly (radius ≤3) never paints onto the
+    // rounded border. We also re-stroke the border below as a safety net.
+    int bx = GLYPH_HW - 5;
+    int by = GLYPH_HH - 5;
     if (!fireInit) {
         for (int i = 0; i < 8; i++) {
             float a = i * 0.785f;
-            fireX[i] = cx + 16 * cosf(a); fireY[i] = cy + 16 * sinf(a);
-            fireVX[i] = 0.9f * cosf(a * 2.3f); fireVY[i] = 0.9f * sinf(a * 1.7f);
+            fireX[i] = cx + (bx * 0.6f) * cosf(a);
+            fireY[i] = cy + (by * 0.6f) * sinf(a);
+            fireVX[i] = 1.1f * cosf(a * 2.3f); fireVY[i] = 0.9f * sinf(a * 1.7f);
         }
         fireInit = true;
     }
     clearGlyph(cx, cy);
     for (int i = 0; i < 8; i++) {
         fireX[i] += fireVX[i]; fireY[i] += fireVY[i];
-        float dx = fireX[i] - cx, dy = fireY[i] - cy;
-        if (dx * dx + dy * dy > 46.0f * 46.0f) { fireVX[i] = -fireVX[i]; fireVY[i] = -fireVY[i]; }
+        if (fireX[i] < cx - bx) { fireX[i] = cx - bx; fireVX[i] = -fireVX[i]; }
+        if (fireX[i] > cx + bx) { fireX[i] = cx + bx; fireVX[i] = -fireVX[i]; }
+        if (fireY[i] < cy - by) { fireY[i] = cy - by; fireVY[i] = -fireVY[i]; }
+        if (fireY[i] > cy + by) { fireY[i] = cy + by; fireVY[i] = -fireVY[i]; }
         uint16_t c = (i & 1) ? COL_ACCENT : COL_CYAN;
         tft.fillCircle((int)fireX[i], (int)fireY[i], (i % 3 == 0) ? 3 : 2, c);
     }
+    // Safety net: redraw the card's rounded border so any grazing pixel is
+    // overwritten (the rect clear can't restore the curved corners otherwise).
+    tft.drawRoundRect(MARGIN, IDLE_ANIM_Y, SCREEN_W - 2 * MARGIN, IDLE_ANIM_H,
+                      6, COL_CARD_BORDER);
+}
+
+// SESSION card: pulsing blue dot + name + "N msg · Nk/M tok" when a chat is
+// active, else a muted dot + "No active session." The dot pulses on the anim
+// clock, so its small area is redrawn each tick (see renderIdle).
+static void drawIdleSessionDot(int x, int y) {
+    // Clear the dot's cell, then draw it at a radius that breathes with idleT.
+    tft.fillRect(x - 6, y - 6, 13, 13, COL_CARD_BG);
+    if (sessionActive) {
+        int r = 3 + (int)roundf(1.5f * (0.5f + 0.5f * sinf(idleT * 1.6f)));  // 3..6
+        tft.fillCircle(x, y, r, COL_ACCENT);
+    } else {
+        tft.fillCircle(x, y, 3, COL_CARD_BORDER);
+    }
+}
+
+static void drawIdleSession() {
+    int w  = tft.width();
+    int x  = MARGIN;
+    int cw = w - 2 * MARGIN;
+    int y  = IDLE_SESS_Y;
+
+    drawCard(x, y, cw, IDLE_SESS_H);
+    int dotX = x + 14;
+    int dotY = y + 18;
+    int txtX = dotX + 12;
+    tft.setTextSize(1);
+
+    if (sessionActive) {
+        // Name (or a placeholder until the first utterance names the session).
+        const char* nm = sessionName[0] ? sessionName : "(naming…)";
+        tft.setTextDatum(ML_DATUM);
+        tft.setTextColor(COL_VALUE, COL_CARD_BG);
+        // Truncate to the card width: ~6px per char at size 1.
+        char line[28];
+        int maxChars = (x + cw - 6 - txtX) / 6;
+        if (maxChars > (int)sizeof(line) - 1) maxChars = sizeof(line) - 1;
+        if ((int)strlen(nm) > maxChars) {
+            int keep = maxChars - 1;
+            if (keep < 1) keep = 1;
+            snprintf(line, sizeof(line), "%.*s.", keep, nm);
+        } else {
+            snprintf(line, sizeof(line), "%s", nm);
+        }
+        tft.drawString(line, txtX, dotY);
+
+        // Meta: "N msg · Nk/M tok"
+        char tok[16];
+        fmtTokens(statsTokens, tok, sizeof(tok));
+        char meta[40];
+        snprintf(meta, sizeof(meta), "%d msg  %s tok", statsMessages, tok);
+        tft.setTextColor(COL_LABEL, COL_CARD_BG);
+        tft.drawString(meta, x + 14, y + IDLE_SESS_H - 16);
+    } else {
+        tft.setTextDatum(ML_DATUM);
+        tft.setTextColor(COL_LABEL, COL_CARD_BG);
+        tft.drawString("Idle", txtX, dotY);
+    }
+
+    drawIdleSessionDot(dotX, dotY);
 }
 
 void renderIdle() {
-    static int lastTeleTemp = -2, lastTeleBatt = -2;
+    static int  lastTeleTemp = -2, lastTeleBatt = -2;
+    static bool lastSessActive = false;
+    static char lastSessName[28] = "\x01";   // impossible initial value
+    static int  lastSessMsgs = -1, lastSessTokens = -1;
     int w = tft.width();
     int cx = w / 2;
     int cy = GLYPH_CY;
@@ -292,7 +403,9 @@ void renderIdle() {
 
         drawHintBar();
         fireInit = false;
-        lastTeleTemp = -2; lastTeleBatt = -2;   // force telemetry redraw
+        lastTeleTemp = -2; lastTeleBatt = -2;     // force telemetry redraw
+        lastSessName[0] = '\x01';                 // force session-card redraw
+        lastSessMsgs = -1; lastSessTokens = -1;
     }
 
     // Telemetry card — redraw only when a value changes
@@ -302,11 +415,25 @@ void renderIdle() {
         drawIdleTelemetry();
     }
 
+    // Session card — redraw when active state, name, or counters change
+    if (sessionActive != lastSessActive
+        || strncmp(sessionName, lastSessName, sizeof(lastSessName)) != 0
+        || statsMessages != lastSessMsgs || statsTokens != lastSessTokens) {
+        lastSessActive = sessionActive;
+        strncpy(lastSessName, sessionName, sizeof(lastSessName) - 1);
+        lastSessName[sizeof(lastSessName) - 1] = '\0';
+        lastSessMsgs = statsMessages;
+        lastSessTokens = statsTokens;
+        drawIdleSession();
+    }
+
     // ── Animated layer ───────────────────────────────────────────────────────
     if (millis() - lastAnimMs > ANIMATION_TICK_MS) {
         lastAnimMs = millis();
         idleT += 0.20f;
         animFireflies(cx, cy);
+        // Pulse the session dot in lockstep with the swarm.
+        drawIdleSessionDot(MARGIN + 14, IDLE_SESS_Y + 18);
     }
 }
 
@@ -357,85 +484,156 @@ static void drawStatCard(int x, int y, int w, int h, const char* label, const ch
     tft.drawString(value, x + w - 10, y + h / 2 + 2);
 }
 
+// Two metrics side-by-side in one card (label on top, value below, each half).
+// Each value renders at size 2, dropping to size 1 if it would overflow its
+// half-column (e.g. a long "12.3k" token count).
+static void drawDuoStatCard(int x, int y, int w, int h,
+                            const char* lA, const char* vA,
+                            const char* lB, const char* vB) {
+    drawCard(x, y, w, h);
+    int half = x + w / 2;
+    int avail = w / 2 - 14;        // usable width per half (inset on both sides)
+    tft.drawFastVLine(half, y + 8, h - 16, COL_CARD_BORDER);
+    int valY = y + h / 2 + 6;
+
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextSize(1);
+    tft.setTextColor(COL_LABEL, COL_CARD_BG);
+    tft.drawString(lA, x + 10, y + 12);
+    tft.drawString(lB, half + 10, y + 12);
+
+    tft.setTextColor(COL_VALUE, COL_CARD_BG);
+    tft.setTextSize(((int)strlen(vA) * 12 <= avail) ? 2 : 1);
+    tft.drawString(vA, x + 10, valY);
+    tft.setTextSize(((int)strlen(vB) * 12 <= avail) ? 2 : 1);
+    tft.drawString(vB, half + 10, valY);
+    tft.setTextSize(1);
+}
+
+// ── Chat-screen layout (header 22 → hints 210) ──────────────────────────────
+#define CHAT_TELE_Y  24         // battery|cpu strip on top
+#define CHAT_TELE_H  34
+#define CHAT_DUO_Y   62         // msgs|tokens
+#define CHAT_DUO_H   38
+#define CHAT_CTX_Y   104        // context one-liner
+#define CHAT_CTX_H   24
+#define CHAT_STAT_Y  132        // STATUS card (dynamic, animated)
+#define CHAT_STAT_H  72         // 132+72 = 204, hints at 210
+
+// STATUS card: label + current phase/tool text, plus an animated spinner dot
+// while busy. The spinner area is redrawn each anim tick (see renderStats).
+static void drawStatusSpinner(int cx, int cy) {
+    tft.fillRect(cx - 7, cy - 7, 15, 15, COL_CARD_BG);
+    if (statusBusy) {
+        // 3 orbiting dots; phase advances with wavePhase.
+        for (int i = 0; i < 3; i++) {
+            float a = idleT * 1.4f + i * 2.094f;        // 120° apart
+            int px = cx + (int)roundf(5 * cosf(a));
+            int py = cy + (int)roundf(5 * sinf(a));
+            uint16_t c = (i == (wavePhase % 3)) ? COL_ACCENT : COL_CARD_BORDER;
+            tft.fillCircle(px, py, 2, c);
+        }
+    } else if (statusText[0]) {
+        tft.fillCircle(cx, cy, 3, COL_GREEN);           // steady = done/idle
+    }
+}
+
+static void drawStatusCard() {
+    int x = MARGIN, cw = tft.width() - 2 * MARGIN;
+    int y = CHAT_STAT_Y;
+    drawCard(x, y, cw, CHAT_STAT_H);
+
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextSize(1);
+    tft.setTextColor(COL_LABEL, COL_CARD_BG);
+    tft.drawString("STATUS", x + 10, y + 13);
+
+    // Phase/tool text, centered in the card body (size 2, may wrap to size 1).
+    const char* s = statusText[0] ? statusText : "Ready";
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(statusBusy ? COL_ACCENT : COL_VALUE, COL_CARD_BG);
+    // Pick size 2 if it fits (~10px/char), else size 1.
+    int len = (int)strlen(s);
+    tft.setTextSize((len * 12 <= cw - 16) ? 2 : 1);
+    tft.drawString(s, x + cw / 2, y + CHAT_STAT_H / 2 + 4);
+    tft.setTextSize(1);
+}
+
 void renderStats() {
     static int lastMsgs = -1;
     static int lastTokens = -1;
     static int lastPct = -1;
-    static bool lastAck = false;
+    static int lastTeleTemp = -2, lastTeleBatt = -2;
+    static char lastStatus[28] = "\x01";
+    static bool lastBusy = false;
 
     int w = tft.width();
-    int h = tft.height();
     bool force = (screen != prevScr);
-    bool ackActive = (millis() < ackUntilMs && ackText[0]);
 
-    // Card geometry
     int cardX = MARGIN;
     int cardW = w - 2 * MARGIN;
-    int cardH = 38;
-    int gap   = 8;
-    int y0    = HEADER_H + 6;          // msgs card top
-    int y1    = y0 + cardH + gap;      // tokens card top
-    int y2    = y1 + cardH + gap;      // context card top
-    int ctxH  = 50;                    // context card is taller (holds bar)
-    int ackY  = y2 + ctxH + gap;       // ack/status line
 
     if (force) {
         tft.fillScreen(COL_BG);
         drawHeader("SESSION");
         drawConnDot(true);
         drawHintBar();
-        // Draw static card frames once
-        drawCard(cardX, y2, cardW, ctxH);
-        lastMsgs = -1; lastTokens = -1; lastPct = -1; lastAck = false;
+        lastMsgs = -1; lastTokens = -1; lastPct = -1;
+        lastTeleTemp = -2; lastTeleBatt = -2;
+        lastStatus[0] = '\x01'; lastBusy = !statusBusy;
     }
 
-    if (force || statsMessages != lastMsgs) {
+    // Battery + CPU temp on top (compact, no charge bar) — redraw on change
+    if (force || teleCpuTemp != lastTeleTemp || teleBattery != lastTeleBatt) {
+        lastTeleTemp = teleCpuTemp;
+        lastTeleBatt = teleBattery;
+        drawTelemetryCard(CHAT_TELE_Y, CHAT_TELE_H, false);
+    }
+
+    // Messages + Tokens in one card — redraw when either changes
+    if (force || statsMessages != lastMsgs || statsTokens != lastTokens) {
         lastMsgs = statsMessages;
-        char buf[12];
-        snprintf(buf, sizeof(buf), "%d", statsMessages);
-        drawStatCard(cardX, y0, cardW, cardH, "MESSAGES", buf);
-    }
-
-    if (force || statsTokens != lastTokens) {
         lastTokens = statsTokens;
-        char buf[24];
-        if (statsTokens >= 1000)
-            snprintf(buf, sizeof(buf), "%d.%dk", statsTokens / 1000, (statsTokens % 1000) / 100);
-        else
-            snprintf(buf, sizeof(buf), "%d", statsTokens);
-        drawStatCard(cardX, y1, cardW, cardH, "TOKENS", buf);
+        char msgBuf[12], tokBuf[24];
+        snprintf(msgBuf, sizeof(msgBuf), "%d", statsMessages);
+        fmtTokens(statsTokens, tokBuf, sizeof(tokBuf));
+        drawDuoStatCard(cardX, CHAT_DUO_Y, cardW, CHAT_DUO_H, "MSGS", msgBuf, "TOKENS", tokBuf);
     }
 
+    // Context one-liner: "CTX   12.3k/200k"
     int pct = statsPct < 0 ? 0 : (statsPct > 100 ? 100 : statsPct);
     if (force || pct != lastPct) {
         lastPct = pct;
-        // Label + percent inside the context card
+        drawCard(cardX, CHAT_CTX_Y, cardW, CHAT_CTX_H);
         tft.setTextDatum(ML_DATUM);
-        tft.setTextColor(COL_LABEL, COL_CARD_BG);
         tft.setTextSize(1);
-        tft.drawString("CONTEXT", cardX + 10, y2 + 13);
-        char pctBuf[8];
-        snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
-        // clear old percent area before redraw
-        tft.fillRect(cardX + cardW - 44, y2 + 6, 36, 14, COL_CARD_BG);
+        tft.setTextColor(COL_LABEL, COL_CARD_BG);
+        tft.drawString("CTX", cardX + 10, CHAT_CTX_Y + CHAT_CTX_H / 2);
+        char used[16], win[16], ctxBuf[40];
+        fmtTokens(statsTokens, used, sizeof(used));
+        fmtTokens(CTX_WINDOW_TOKENS, win, sizeof(win));
+        snprintf(ctxBuf, sizeof(ctxBuf), "%s/%s  %d%%", used, win, pct);
+        uint16_t col = (pct >= 85) ? COL_RED : (pct >= 60 ? COL_ORANGE : COL_VALUE);
         tft.setTextDatum(MR_DATUM);
-        tft.setTextColor(COL_VALUE, COL_CARD_BG);
-        tft.drawString(pctBuf, cardX + cardW - 10, y2 + 13);
-        uint16_t barCol = (pct >= 85) ? COL_RED : (pct >= 60 ? COL_ORANGE : COL_ACCENT);
-        drawBar(cardX + 10, y2 + ctxH - 16, cardW - 20, 8, pct, barCol);
+        tft.setTextColor(col, COL_CARD_BG);
+        tft.drawString(ctxBuf, cardX + cardW - 10, CHAT_CTX_Y + CHAT_CTX_H / 2);
     }
 
-    if (ackActive || lastAck != ackActive) {
-        lastAck = ackActive;
-        tft.fillRect(MARGIN, ackY, cardW, 12, COL_BG);
-        if (ackActive) {
-            tft.setTextColor(COL_ACCENT, COL_BG);
-            tft.setTextSize(1);
-            tft.setTextDatum(ML_DATUM);
-            char statusBuf[40];
-            snprintf(statusBuf, sizeof(statusBuf), "> %s", ackText);
-            tft.drawString(statusBuf, MARGIN + 2, ackY + 5);
-        }
+    // STATUS card — redraw text when status/busy changes
+    if (force || strncmp(statusText, lastStatus, sizeof(lastStatus)) != 0
+        || statusBusy != lastBusy) {
+        strncpy(lastStatus, statusText, sizeof(lastStatus) - 1);
+        lastStatus[sizeof(lastStatus) - 1] = '\0';
+        lastBusy = statusBusy;
+        drawStatusCard();
+    }
+
+    // Animated spinner in the STATUS card
+    if (millis() - lastAnimMs > ANIMATION_TICK_MS) {
+        lastAnimMs = millis();
+        idleT += 0.20f;
+        wavePhase = (wavePhase + 1) % 8;
+        drawStatusSpinner(MARGIN + cardW - 16, CHAT_STAT_Y + 14);
     }
 }
 
@@ -491,6 +689,15 @@ void displayTick() {
         statsStale = (millis() - lastStatsMs > STALE_DATA_MS);
     }
 
+    // Auto-return to idle after IDLE_TIMEOUT_MS of no activity (any PTT /
+    // new_chat / incoming stats). The session stays active and is shown on the
+    // idle SESSION card. Never times out while actively talking or starting.
+    if (screen == SCR_STATS && lastActivityMs > 0
+        && millis() - lastActivityMs > IDLE_TIMEOUT_MS) {
+        screen  = SCR_IDLE;
+        prevScr = SCR_STATS;
+    }
+
     // Starting animation dot update
     if (screen == SCR_STARTING) {
         if (startingSinceMs > 0 && millis() - startingSinceMs > STARTING_TIMEOUT_MS) {
@@ -528,10 +735,15 @@ void handleMessage(const char* line) {
         // New session confirmed
         const char* sid = doc["session_id"] | "";
         strncpy(statsSessionId, sid, sizeof(statsSessionId) - 1);
+        const char* nm = doc["name"] | "";          // usually empty at start
+        strncpy(sessionName, nm, sizeof(sessionName) - 1);
+        sessionName[sizeof(sessionName) - 1] = '\0';
+        sessionActive = true;
         statsMessages = 0;
         statsTokens   = 0;
         statsPct      = 0;
         lastStatsMs   = millis();
+        lastActivityMs = millis();
         statsStale    = false;
         startingSinceMs = 0;
         newChatPending = false;
@@ -541,13 +753,24 @@ void handleMessage(const char* line) {
         btn1LastAcceptedMs = millis();
         ackText[0] = '\0';
         ackUntilMs = 0;
+        statusText[0] = '\0';
+        statusBusy = false;
+
+    } else if (strcmp(type, "session_name") == 0) {
+        // Name learned from the first utterance — refresh the SESSION card.
+        const char* nm = doc["name"] | "";
+        strncpy(sessionName, nm, sizeof(sessionName) - 1);
+        sessionName[sizeof(sessionName) - 1] = '\0';
+        sessionActive = true;
 
     } else if (strcmp(type, "chat_stats") == 0) {
         statsMessages = doc["messages"] | statsMessages;
         statsTokens   = doc["tokens"]   | statsTokens;
         statsPct      = doc["context_pct"] | statsPct;
         lastStatsMs   = millis();
+        lastActivityMs = millis();
         statsStale    = false;
+        sessionActive = true;
         if (screen != SCR_PTT) screen = SCR_STATS;
 
     } else if (strcmp(type, "telemetry") == 0) {
@@ -555,6 +778,14 @@ void handleMessage(const char* line) {
         // Missing fields keep their previous value (-1 = unknown).
         teleCpuTemp = doc["cpu_temp"] | teleCpuTemp;
         teleBattery = doc["battery"]  | teleBattery;
+
+    } else if (strcmp(type, "status") == 0) {
+        // Live phase/tool for the STATUS card — persists until the next status.
+        const char* txt = doc["text"] | "";
+        strncpy(statusText, txt, sizeof(statusText) - 1);
+        statusText[sizeof(statusText) - 1] = '\0';
+        statusBusy = doc["busy"] | false;
+        lastActivityMs = millis();
 
     } else if (strcmp(type, "ack") == 0) {
         const char* txt = doc["text"] | "";
@@ -565,6 +796,10 @@ void handleMessage(const char* line) {
         const char* txt = doc["text"] | "error";
         strncpy(ackText, txt, sizeof(ackText) - 1);
         ackUntilMs = millis() + 4000;
+        sessionActive = false;
+        sessionName[0] = '\0';
+        statusText[0] = '\0';
+        statusBusy = false;
         screen = SCR_IDLE;
     }
 }
@@ -683,6 +918,7 @@ void loop() {
                     screen = SCR_PTT;
                     prevScr = SCR_STATS;
                     lastAnimMs = 0;
+                    lastActivityMs = millis();
                     Serial.print("{\"debug\":\"btn1_ptt_start\",\"hold_ms\":");
                     Serial.print(holdTime);
                     Serial.println("}");
@@ -698,6 +934,7 @@ void loop() {
                 btn1WasPtt = false;
                 screen = (statsMessages > 0) ? SCR_STATS : SCR_IDLE;
                 prevScr = SCR_PTT;
+                lastActivityMs = millis();
                 sendEvent("ptt_stop");
             }
             btn1PressMs = 0;
@@ -731,6 +968,7 @@ void loop() {
             screen    = SCR_STARTING;
             startingDots = 0;
             lastDotMs    = now;
+            lastActivityMs = now;
             prevScr      = SCR_STATS; // force full redraw on next tick
             sendEvent("new_chat");
         }

@@ -194,11 +194,20 @@ Works with whatever mic/speaker your OS uses as the PipeWire defaults — a USB 
 **Bridge → TTGO:**
 
 ```json
-{"type": "chat_started", "session_id": "..."}
-{"type": "chat_stats",   "messages": 3, "tokens": 4200, "context_pct": 2}
-{"type": "ack",          "text": "Thinking..."}    // green banner (≤21 chars)
-{"type": "error",        "text": "No session"}     // returns to idle
+{"type": "chat_started",  "session_id": "...", "name": ""}   // name empty at start
+{"type": "session_name",  "name": "what time is it"}         // learned from 1st utterance
+{"type": "chat_stats",    "messages": 3, "tokens": 4200, "context_pct": 2}
+{"type": "status",        "text": "Searching web", "busy": true}  // STATUS card
+{"type": "telemetry",     "cpu_temp": 47, "battery": 84}     // host metrics, either optional
+{"type": "ack",           "text": "Thinking..."}    // green banner (≤21 chars)
+{"type": "error",         "text": "No session"}     // returns to idle
 ```
+
+**Live STATUS card:** During a turn the bridge streams the Hermes response (`stream: true`) and forwards each phase to the chat screen's STATUS card via `status` messages: `Transcribing → Thinking → <tool label> → Writing reply → Speaking → Ready`. Tool steps come from Hermes `event: hermes.tool.progress` SSE events (tool name mapped to a short label like *Running code*, *Searching web*). `busy: true` animates a spinner dot; `busy: false` shows a steady green dot. The status persists until replaced (no timeout), so a long "Thinking" no longer goes blank.
+
+**Session name:** A session has no friendly name until the user speaks. On the first `ptt_stop`, the bridge takes the transcript, trims it to ~24 chars on a word boundary, and sends `session_name`. The TTGO idle **SESSION card** shows this name plus `N msg · Nk/M tok`; when no chat is active it shows *"No active session."*
+
+**Auto-idle:** After `IDLE_TIMEOUT_MS` (2 min) with no activity — no PTT, `new_chat`, or incoming `chat_stats` — the stats screen falls back to the idle dashboard. The session stays active on the host and is shown on the SESSION card.
 
 **Session lifecycle:** When `new_chat` fires, the bridge closes the current session on the Hermes server (`DELETE /api/sessions/{id}`) in a background thread before starting the new one. This frees server-side memory and produces a clean break in the session DB.
 

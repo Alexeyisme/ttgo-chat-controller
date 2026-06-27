@@ -49,5 +49,6 @@
 // ── Timing ─────────────────────────────────────────────────────────────────────
 #define ANIMATION_TICK_MS   80      // Slightly faster animations
 #define STALE_DATA_MS       30000   // Stale indicator after 30s no update
+#define IDLE_TIMEOUT_MS     120000  // Stats → idle after 2 min of no activity
 
 #endif // CONFIG_H
