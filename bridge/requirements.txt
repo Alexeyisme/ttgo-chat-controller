@@ -3,3 +3,6 @@
 # provides the provider SDKs (groq/openai/edge-tts/etc.) per ~/.hermes/config.yaml.
 requests>=2.31.0
 pyserial>=3.5
+# Optional: battery % from a MAX17040 fuel gauge over I²C (e.g. X1209 UPS HAT).
+# The bridge degrades gracefully (omits battery) if this is missing.
+smbus2>=0.4.0

@@ -488,6 +488,69 @@ def send_stats(transport: SerialTransport):
     })
 
 
+# ── Host telemetry (Pi CPU temp + battery) ──────────────────────────────────────
+def read_cpu_temp_c() -> Optional[int]:
+    """Pi CPU temperature in whole °C, or None if unreadable."""
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return round(int(f.read().strip()) / 1000)
+    except (OSError, ValueError):
+        return None
+
+
+# X1209 UPS uses a MAX17040 fuel gauge on I²C (not sysfs power_supply).
+# SOC is register 0x04, read as a big-endian word, /256 = percent.
+# Matches /usr/local/bin/x1209_monitor.py on Tulpa (see project memory).
+_MAX17040_ADDR = 0x36
+_MAX17040_SOC_REG = 0x04
+_i2c_bus = None          # cached smbus handle; False once known-unavailable
+
+
+def read_battery_pct() -> Optional[int]:
+    """Battery charge % from the MAX17040 fuel gauge over I²C, falling back
+    to sysfs power_supply. Returns None if no battery source is available."""
+    global _i2c_bus
+    if _i2c_bus is not False:
+        try:
+            if _i2c_bus is None:
+                try:
+                    import smbus2 as smbus      # pure-Python, venv-friendly
+                except ImportError:
+                    import smbus                 # system python-smbus
+                _i2c_bus = smbus.SMBus(1)
+            raw = _i2c_bus.read_word_data(_MAX17040_ADDR, _MAX17040_SOC_REG)
+            soc = ((raw & 0xFF) << 8 | (raw >> 8)) / 256.0   # byte-swap, /256
+            return max(0, min(100, round(soc)))
+        except (ImportError, OSError):
+            _i2c_bus = False        # gauge/bus not present — stop retrying
+
+    # Fallback: standard sysfs battery (other hosts / UPS HATs)
+    base = Path("/sys/class/power_supply")
+    if base.is_dir():
+        for ps in sorted(base.iterdir()):
+            try:
+                if (ps / "type").read_text().strip() != "Battery":
+                    continue
+                return int((ps / "capacity").read_text().strip())
+            except (OSError, ValueError):
+                continue
+    return None
+
+
+def send_telemetry(transport: SerialTransport):
+    """Push host CPU temp + battery to the TTGO. Omits fields that are
+    unavailable so the firmware can hide them."""
+    payload = {"type": "telemetry"}
+    temp = read_cpu_temp_c()
+    if temp is not None:
+        payload["cpu_temp"] = temp
+    batt = read_battery_pct()
+    if batt is not None:
+        payload["battery"] = batt
+    if len(payload) > 1:        # only send if we have at least one metric
+        transport.send(payload)
+
+
 def handle_new_chat(transport: SerialTransport):
     global chat_starting
     with chat_start_lock:
@@ -590,7 +653,16 @@ def run(transport: SerialTransport):
     log.info("Hermes API: %s  model: %s", API_BASE, API_MODEL)
     log.info("Audio: PipeWire default source (mic) + default sink (playback)")
 
+    TELEMETRY_INTERVAL = 10.0       # seconds between CPU temp / battery pushes
+    next_telemetry = 0.0
+
     while True:
+        # Periodic host telemetry (CPU temp + battery) for the idle screen.
+        now = time.monotonic()
+        if transport.connected and now >= next_telemetry:
+            send_telemetry(transport)
+            next_telemetry = now + TELEMETRY_INTERVAL
+
         line = transport.readline()
         if not line:
             # When disconnected, readline() returns quickly after a reconnect
@@ -617,6 +689,7 @@ def run(transport: SerialTransport):
         if event == "device_ready":
             log.info("TTGO ready")
             transport.send({"type": "ack", "text": "Bridge OK"})
+            send_telemetry(transport)
 
         elif event == "new_chat":
             threading.Thread(

@@ -46,6 +46,10 @@ unsigned long lastStatsMs = 0;
 char   ackText[32]    = "";
 unsigned long ackUntilMs = 0;
 
+// Host telemetry (Pi CPU temp + battery), -1 = unknown/not reported
+int  teleCpuTemp      = -1;     // °C
+int  teleBattery      = -1;     // %
+
 // PTT waveform animation
 unsigned long lastAnimMs  = 0;
 int  wavePhase            = 0;
@@ -172,20 +176,110 @@ void drawHintBar() {
 }
 
 // ── Screen renderers ──────────────────────────────────────────────────────────
-// Orbiting-mind glyph geometry
-#define ORBIT_R1     18         // inner orbit radius
-#define ORBIT_R2     30         // outer orbit radius
-#define ORBIT_CORE   7          // core orb radius
-#define ORBIT_CLEAR  (ORBIT_R2 + 6)   // bounding box half-size to clear each frame
+// Idle is a card dashboard: a telemetry card (battery + CPU temp) on top and an
+// animation card below. The animation is centered in its card at GLYPH_CY and
+// owns a clear box of half-size GLYPH_CLEAR.
+#define IDLE_TELE_Y  28         // telemetry card top
+#define IDLE_TELE_H  44         // telemetry card height
+#define IDLE_ANIM_Y  80         // animation card top
+#define IDLE_ANIM_H  124        // animation card height (down to just above hints)
+#define GLYPH_CY     (IDLE_ANIM_Y + IDLE_ANIM_H / 2)   // = 142
+#define GLYPH_CLEAR  50         // half-size of the square cleared each frame
 
-float idleOrbitAngle = 0.0f;    // inner-ring satellites angle
-float idleRedAngle   = 0.0f;    // outer-ring red sphere angle (own full-360 loop)
+// ── Idle animation ──────────────────────────────────────────────────────────
+float idleT = 0.0f;     // generic phase, advances each tick
+
+// Firefly swarm persistent state
+float fireX[8], fireY[8], fireVX[8], fireVY[8];
+bool  fireInit = false;
+
+static inline void clearGlyph(int cx, int cy) {
+    // Animation lives inside the animation card — clear to the card background.
+    tft.fillRect(cx - GLYPH_CLEAR, cy - GLYPH_CLEAR,
+                 2 * GLYPH_CLEAR, 2 * GLYPH_CLEAR, COL_CARD_BG);
+}
+
+// Telemetry card: BATTERY (left half, value + bar) | CPU (right half).
+// A metric that hasn't been reported (value < 0) shows a muted "--".
+static void drawIdleTelemetry() {
+    int w  = tft.width();
+    int x  = MARGIN;
+    int cw = w - 2 * MARGIN;
+    int y  = IDLE_TELE_Y;
+    int half = x + cw / 2;
+
+    drawCard(x, y, cw, IDLE_TELE_H);
+    tft.drawFastVLine(half, y + 8, IDLE_TELE_H - 16, COL_CARD_BORDER);
+    tft.setTextSize(1);
+
+    // ── Battery (left half) ──────────────────────────────────────────────
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(COL_LABEL, COL_CARD_BG);
+    tft.drawString("BATTERY", x + 10, y + 12);
+    if (teleBattery >= 0) {
+        uint16_t col = (teleBattery <= 15) ? COL_RED
+                     : (teleBattery <= 40) ? COL_ORANGE : COL_GREEN;
+        char b[8];
+        snprintf(b, sizeof(b), "%d%%", teleBattery);
+        tft.setTextColor(COL_VALUE, COL_CARD_BG);
+        tft.setTextSize(2);
+        tft.drawString(b, x + 10, y + 30);
+        tft.setTextSize(1);
+        // slim charge bar under the value
+        drawBar(x + 10, y + IDLE_TELE_H - 9, cw / 2 - 20, 4, teleBattery, col);
+    } else {
+        tft.setTextColor(COL_CARD_BORDER, COL_CARD_BG);
+        tft.setTextSize(2);
+        tft.drawString("--", x + 10, y + 30);
+        tft.setTextSize(1);
+    }
+
+    // ── CPU temp (right half) ────────────────────────────────────────────
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(COL_LABEL, COL_CARD_BG);
+    tft.drawString("CPU", half + 10, y + 12);
+    if (teleCpuTemp >= 0) {
+        uint16_t col = (teleCpuTemp >= 75) ? COL_RED
+                     : (teleCpuTemp >= 60) ? COL_ORANGE : COL_VALUE;
+        char t[12];
+        snprintf(t, sizeof(t), "%dC", teleCpuTemp);
+        tft.setTextColor(col, COL_CARD_BG);
+        tft.setTextSize(2);
+        tft.drawString(t, half + 10, y + 30);
+        tft.setTextSize(1);
+    } else {
+        tft.setTextColor(COL_CARD_BORDER, COL_CARD_BG);
+        tft.setTextSize(2);
+        tft.drawString("--", half + 10, y + 30);
+        tft.setTextSize(1);
+    }
+}
+
+// Firefly swarm drifting within a soft circle (the idle animation)
+static void animFireflies(int cx, int cy) {
+    if (!fireInit) {
+        for (int i = 0; i < 8; i++) {
+            float a = i * 0.785f;
+            fireX[i] = cx + 16 * cosf(a); fireY[i] = cy + 16 * sinf(a);
+            fireVX[i] = 0.9f * cosf(a * 2.3f); fireVY[i] = 0.9f * sinf(a * 1.7f);
+        }
+        fireInit = true;
+    }
+    clearGlyph(cx, cy);
+    for (int i = 0; i < 8; i++) {
+        fireX[i] += fireVX[i]; fireY[i] += fireVY[i];
+        float dx = fireX[i] - cx, dy = fireY[i] - cy;
+        if (dx * dx + dy * dy > 46.0f * 46.0f) { fireVX[i] = -fireVX[i]; fireVY[i] = -fireVY[i]; }
+        uint16_t c = (i & 1) ? COL_ACCENT : COL_CYAN;
+        tft.fillCircle((int)fireX[i], (int)fireY[i], (i % 3 == 0) ? 3 : 2, c);
+    }
+}
 
 void renderIdle() {
+    static int lastTeleTemp = -2, lastTeleBatt = -2;
     int w = tft.width();
-    int h = tft.height();
     int cx = w / 2;
-    int cy = (HEADER_H + (h - HINT_H)) / 2 - 14;
+    int cy = GLYPH_CY;
 
     // ── Static layer: draw once on entry ────────────────────────────────────
     if (screen != prevScr) {
@@ -193,55 +287,26 @@ void renderIdle() {
         drawHeader("TULPA");
         drawConnDot(true);
 
-        // Two faint orbit rings (the "mind's" aura)
-        tft.drawCircle(cx, cy, ORBIT_R1, COL_CARD_BORDER);
-        tft.drawCircle(cx, cy, ORBIT_R2, COL_CARD_BORDER);
-
-        tft.setTextColor(COL_ACCENT, COL_BG);
-        tft.setTextSize(2);
-        tft.setTextDatum(MC_DATUM);
-        tft.drawString("Tulpa", cx, cy + 52);
-
-        tft.setTextColor(COL_LABEL, COL_BG);
-        tft.setTextSize(1);
-        tft.drawString("hermes-agent inside", cx, cy + 74);
+        // Animation card frame (content drawn each tick inside it)
+        drawCard(MARGIN, IDLE_ANIM_Y, w - 2 * MARGIN, IDLE_ANIM_H);
 
         drawHintBar();
+        fireInit = false;
+        lastTeleTemp = -2; lastTeleBatt = -2;   // force telemetry redraw
     }
 
-    // ── Animated layer: orbiting satellites + pulsing core, every tick ───────
+    // Telemetry card — redraw only when a value changes
+    if (teleCpuTemp != lastTeleTemp || teleBattery != lastTeleBatt) {
+        lastTeleTemp = teleCpuTemp;
+        lastTeleBatt = teleBattery;
+        drawIdleTelemetry();
+    }
+
+    // ── Animated layer ───────────────────────────────────────────────────────
     if (millis() - lastAnimMs > ANIMATION_TICK_MS) {
         lastAnimMs = millis();
-        idleOrbitAngle += 0.18f;
-        if (idleOrbitAngle >= 6.2832f) idleOrbitAngle -= 6.2832f;
-        // Red sphere advances steadily and wraps — completes a full 360° loop
-        idleRedAngle += 0.11f;
-        if (idleRedAngle >= 6.2832f) idleRedAngle -= 6.2832f;
-
-        // Clear the glyph region, then repaint the static rings under the dots
-        tft.fillRect(cx - ORBIT_CLEAR, cy - ORBIT_CLEAR,
-                     2 * ORBIT_CLEAR, 2 * ORBIT_CLEAR, COL_BG);
-        tft.drawCircle(cx, cy, ORBIT_R1, COL_CARD_BORDER);
-        tft.drawCircle(cx, cy, ORBIT_R2, COL_CARD_BORDER);
-
-        // Two satellites on the inner ring (opposite each other)
-        for (int i = 0; i < 2; i++) {
-            float a = idleOrbitAngle + i * 3.1416f;
-            int sx = cx + (int)(ORBIT_R1 * cosf(a));
-            int sy = cy + (int)(ORBIT_R1 * sinf(a));
-            tft.fillCircle(sx, sy, 2, COL_ACCENT);
-        }
-        // Red sphere on the outer ring — travels the full 360°
-        {
-            int sx = cx + (int)(ORBIT_R2 * cosf(idleRedAngle));
-            int sy = cy + (int)(ORBIT_R2 * sinf(idleRedAngle));
-            tft.fillCircle(sx, sy, 3, COL_RED);
-        }
-
-        // Gently pulsing core
-        int pulse = (idleOrbitAngle < 3.1416f) ? 0 : 1;
-        tft.fillCircle(cx, cy, ORBIT_CORE + pulse, COL_ACCENT);
-        tft.fillCircle(cx, cy, (ORBIT_CORE + pulse) - 3, COL_CYAN);
+        idleT += 0.20f;
+        animFireflies(cx, cy);
     }
 }
 
@@ -484,6 +549,12 @@ void handleMessage(const char* line) {
         lastStatsMs   = millis();
         statsStale    = false;
         if (screen != SCR_PTT) screen = SCR_STATS;
+
+    } else if (strcmp(type, "telemetry") == 0) {
+        // Host CPU temp / battery for the idle status strip.
+        // Missing fields keep their previous value (-1 = unknown).
+        teleCpuTemp = doc["cpu_temp"] | teleCpuTemp;
+        teleBattery = doc["battery"]  | teleBattery;
 
     } else if (strcmp(type, "ack") == 0) {
         const char* txt = doc["text"] | "";
